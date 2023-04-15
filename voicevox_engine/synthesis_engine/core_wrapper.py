@@ -9,6 +9,11 @@ from typing import List, Optional
 
 import numpy as np
 
+from vv_core_inference.make_decode_forwarder import make_decode_forwarder
+from vv_core_inference.make_yukarin_s_forwarder import make_yukarin_s_forwarder
+from vv_core_inference.make_yukarin_sa_forwarder import make_yukarin_sa_forwarder
+from vv_core_inference.make_yukarin_sosf_forwarder import make_yukarin_sosf_forwarder
+
 
 class OldCoreError(Exception):
     """古いコアが使用されている場合に発生するエラー"""
@@ -356,7 +361,6 @@ class CoreWrapper:
         cpu_num_threads: int = 0,
         load_all_models: bool = False,
     ) -> None:
-
         self.core = load_core(core_dir, use_gpu)
 
         self.core.initialize.restype = c_bool
@@ -436,6 +440,25 @@ class CoreWrapper:
         finally:
             os.chdir(cwd)
 
+        device = "cpu"
+        self.yukarin_s_forwarder = make_yukarin_s_forwarder(
+            yukarin_s_model_dir=Path("../vv_core_inference/model/yukarin_s"),
+            device=device,
+        )
+        self.yukarin_sa_forwarder = make_yukarin_sa_forwarder(
+            yukarin_sa_model_dir=Path("../vv_core_inference/model/yukarin_sa"),
+            device=device,
+        )
+        self.yukarin_sosf_forwarder = make_yukarin_sosf_forwarder(
+            yukarin_sosf_model_dir=Path("../vv_core_inference/model/yukarin_sosf"),
+            device=device,
+        )
+        self.decode_forwarder = make_decode_forwarder(
+            yukarin_sosoa_model_dir=Path("../vv_core_inference/model/yukarin_sosoa"),
+            hifigan_model_dir=Path("../vv_core_inference/model/hifigan"),
+            device=device,
+        )
+
     def metas(self) -> str:
         return self.core.metas().decode("utf-8")
 
@@ -445,14 +468,10 @@ class CoreWrapper:
         phoneme_list: np.ndarray,
         speaker_id: np.ndarray,
     ) -> np.ndarray:
-        output = np.zeros((length,), dtype=np.float32)
-        self.assert_core_success(
-            self.core.yukarin_s_forward(
-                c_int(length),
-                phoneme_list.ctypes.data_as(POINTER(c_long)),
-                speaker_id.ctypes.data_as(POINTER(c_long)),
-                output.ctypes.data_as(POINTER(c_float)),
-            )
+        output = self.yukarin_s_forwarder(
+            length,
+            phoneme_list,
+            speaker_id,
         )
         return output
 
@@ -467,26 +486,16 @@ class CoreWrapper:
         end_accent_phrase_list: np.ndarray,
         speaker_id: np.ndarray,
     ) -> np.ndarray:
-        output = np.empty(
-            (
-                len(speaker_id),
-                length,
-            ),
-            dtype=np.float32,
-        )
-        self.assert_core_success(
-            self.core.yukarin_sa_forward(
-                c_int(length),
-                vowel_phoneme_list.ctypes.data_as(POINTER(c_long)),
-                consonant_phoneme_list.ctypes.data_as(POINTER(c_long)),
-                start_accent_list.ctypes.data_as(POINTER(c_long)),
-                end_accent_list.ctypes.data_as(POINTER(c_long)),
-                start_accent_phrase_list.ctypes.data_as(POINTER(c_long)),
-                end_accent_phrase_list.ctypes.data_as(POINTER(c_long)),
-                speaker_id.ctypes.data_as(POINTER(c_long)),
-                output.ctypes.data_as(POINTER(c_float)),
-            )
-        )
+        output = self.yukarin_sa_forwarder(
+            length,
+            vowel_phoneme_list[0],
+            consonant_phoneme_list[0],
+            start_accent_list[0],
+            end_accent_list[0],
+            start_accent_phrase_list[0],
+            end_accent_phrase_list[0],
+            speaker_id,
+        )[None]
         return output
 
     def decode_forward(
@@ -497,18 +506,22 @@ class CoreWrapper:
         phoneme: np.ndarray,
         speaker_id: np.ndarray,
     ) -> np.ndarray:
-        output = np.empty((length * 256,), dtype=np.float32)
-        self.assert_core_success(
-            self.core.decode_forward(
-                c_int(length),
-                c_int(phoneme_size),
-                f0.ctypes.data_as(POINTER(c_float)),
-                phoneme.ctypes.data_as(POINTER(c_float)),
-                speaker_id.ctypes.data_as(POINTER(c_long)),
-                output.ctypes.data_as(POINTER(c_float)),
-            )
+        f0, voiced = self.yukarin_sosf_forwarder(
+            length,
+            f0,
+            np.argmax(phoneme, axis=1),
+            speaker_id,
         )
-        return output
+        f0[~voiced] = 0
+
+        output = self.decode_forwarder(
+            length,
+            phoneme_size,
+            f0[:, None],
+            phoneme,
+            speaker_id,
+        )
+        return output[1]
 
     def supported_devices(self) -> str:
         if self.exist_supported_devices:
