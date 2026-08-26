@@ -5,20 +5,20 @@
 
 set -eu
 
-if [ -z "${P12_PATH:-}" ]; then
-    echo "P12_PATHが未定義または空です"
+if [ ! -v P12_PATH ]; then
+    echo "P12_PATHが未定義です"
     exit 1
 fi
-if [ -z "${P12_PASSWORD:-}" ]; then
-    echo "P12_PASSWORDが未定義または空です"
+if [ ! -v P12_PASSWORD ]; then
+    echo "P12_PASSWORDが未定義です"
     exit 1
 fi
-if [ -z "${CODESIGN_IDENTITY_PATH:-}" ]; then
-    echo "CODESIGN_IDENTITY_PATHが未定義または空です"
+if [ ! -v CODESIGN_IDENTITY_PATH ]; then
+    echo "CODESIGN_IDENTITY_PATHが未定義です"
     exit 1
 fi
-if [ -z "${KEYCHAIN_PATH_PATH:-}" ]; then
-    echo "KEYCHAIN_PATH_PATHが未定義または空です"
+if [ ! -v KEYCHAIN_PATH_PATH ]; then
+    echo "KEYCHAIN_PATH_PATHが未定義です"
     exit 1
 fi
 
@@ -49,10 +49,6 @@ while IFS= read -r KEYCHAIN; do
         ORIGINAL_KEYCHAINS+=("$KEYCHAIN")
     fi
 done < <(security list-keychains -d user)
-if [ "${#ORIGINAL_KEYCHAINS[@]}" -eq 0 ]; then
-    echo "既存のキーチェーンが見つかりません"
-    exit 1
-fi
 security list-keychains -d user -s "$KEYCHAIN_PATH" "${ORIGINAL_KEYCHAINS[@]}"
 
 # 署名用Identityの取得

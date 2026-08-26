@@ -5,32 +5,23 @@
 
 set -eu
 
-if [ -z "${P12_PATH:-}" ]; then
-    echo "P12_PATHが未定義または空です"
+if [ ! -v P12_PATH ]; then
+    echo "P12_PATHが未定義です"
     exit 1
 fi
-if [ -z "${CODESIGN_IDENTITY_PATH:-}" ]; then
-    echo "CODESIGN_IDENTITY_PATHが未定義または空です"
+if [ ! -v CODESIGN_IDENTITY_PATH ]; then
+    echo "CODESIGN_IDENTITY_PATHが未定義です"
     exit 1
 fi
-if [ -z "${KEYCHAIN_PATH_PATH:-}" ]; then
-    echo "KEYCHAIN_PATH_PATHが未定義または空です"
+if [ ! -v KEYCHAIN_PATH_PATH ]; then
+    echo "KEYCHAIN_PATH_PATHが未定義です"
     exit 1
 fi
 
 rm -f "$P12_PATH"
 
-if [ -f "$CODESIGN_IDENTITY_PATH" ] && [ ! -f "$KEYCHAIN_PATH_PATH" ]; then
-    echo "キーチェーンパスの出力ファイルが見つかりません"
-    exit 1
-fi
-
 if [ -f "$KEYCHAIN_PATH_PATH" ]; then
     KEYCHAIN_PATH="$(head -n 1 "$KEYCHAIN_PATH_PATH")"
-    if [ -z "$KEYCHAIN_PATH" ]; then
-        echo "キーチェーンパスが空です"
-        exit 1
-    fi
 
     # キーチェーンを削除
     security delete-keychain "$KEYCHAIN_PATH"

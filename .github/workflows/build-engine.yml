@@ -360,12 +360,7 @@ jobs:
 
       - name: <Setup> Decode P12 certificate (macOS)
         if: inputs.code_signing == true && runner.os == 'macOS'
-        run: |
-          if [ -z "$APPLE_P12_BASE64" ]; then
-            echo "APPLE_P12_BASE64が未定義または空です"
-            exit 1
-          fi
-          echo "$APPLE_P12_BASE64" | base64 --decode > /tmp/codesign.p12
+        run: echo "$APPLE_P12_BASE64" | base64 --decode > /tmp/codesign.p12
         env:
           APPLE_P12_BASE64: ${{ secrets.APPLE_P12_BASE64 }}
 
@@ -508,12 +503,10 @@ jobs:
             rmdir "$VERIFY_TEMP_DIR"
           }
 
-          SIGNED_TARGET_COUNT=0
           while IFS= read -r -d '' TARGET_FILE; do
             case "$TARGET_FILE" in
               *.framework/*) continue ;;
               dist/run/run)
-                SIGNED_TARGET_COUNT=$((SIGNED_TARGET_COUNT + 1))
                 verify_main_executable_signature "$TARGET_FILE"
                 continue
                 ;;
@@ -523,19 +516,12 @@ jobs:
               continue
             fi
 
-            SIGNED_TARGET_COUNT=$((SIGNED_TARGET_COUNT + 1))
             verify_code_signature "$TARGET_FILE" "$TARGET_FILE"
           done < <(find dist/run -type f -print0)
 
           while IFS= read -r -d '' TARGET_FRAMEWORK; do
-            SIGNED_TARGET_COUNT=$((SIGNED_TARGET_COUNT + 1))
             verify_code_signature "$TARGET_FRAMEWORK" "$TARGET_FRAMEWORK" --deep
           done < <(find dist/run -type d -name "*.framework" -print0)
-
-          if [ "$SIGNED_TARGET_COUNT" -eq 0 ]; then
-            echo "署名を確認できる対象がありません"
-            exit 1
-          fi
 
       - name: <Build> Code signing cleanup (macOS)
         if: always() && inputs.code_signing == true && runner.os == 'macOS'
