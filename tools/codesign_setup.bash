@@ -26,7 +26,6 @@ fi
 KEYCHAIN_PATH="$(mktemp -d)/codesign.keychain-db"
 KEYCHAIN_PASSWORD="$(uuidgen)"
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-echo "$KEYCHAIN_PATH" >"$KEYCHAIN_PATH_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
@@ -41,13 +40,11 @@ security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P "$P12_PASSWORD" -T /usr/bin/c
 security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
 
 ORIGINAL_KEYCHAINS=()
-while IFS= read -r KEYCHAIN; do
-    KEYCHAIN="${KEYCHAIN#"${KEYCHAIN%%[![:space:]]*}"}"
-    KEYCHAIN="${KEYCHAIN#\"}"
-    KEYCHAIN="${KEYCHAIN%\"}"
-    if [ -n "$KEYCHAIN" ]; then
-        ORIGINAL_KEYCHAINS+=("$KEYCHAIN")
-    fi
+while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line#\"}"
+    line="${line%\"}"
+    [ -n "$line" ] && ORIGINAL_KEYCHAINS+=("$line")
 done < <(security list-keychains -d user)
 security list-keychains -d user -s "$KEYCHAIN_PATH" "${ORIGINAL_KEYCHAINS[@]}"
 
@@ -60,3 +57,6 @@ fi
 
 # 署名用Identityを出力
 echo "$IDENTITY" >"$CODESIGN_IDENTITY_PATH"
+
+# キーチェーンパスを出力
+echo "$KEYCHAIN_PATH" >"$KEYCHAIN_PATH_PATH"

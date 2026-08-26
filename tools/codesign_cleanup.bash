@@ -18,15 +18,12 @@ if [ ! -v KEYCHAIN_PATH_PATH ]; then
     exit 1
 fi
 
-rm -f "$P12_PATH"
+KEYCHAIN_PATH="$(head -n 1 "$KEYCHAIN_PATH_PATH")"
 
-if [ -f "$KEYCHAIN_PATH_PATH" ]; then
-    KEYCHAIN_PATH="$(head -n 1 "$KEYCHAIN_PATH_PATH")"
+# キーチェーンを削除
+security delete-keychain "$KEYCHAIN_PATH"
 
-    # キーチェーンを削除
-    security delete-keychain "$KEYCHAIN_PATH"
-fi
-
-# 出力ファイルを削除
-rm -f "$CODESIGN_IDENTITY_PATH"
-rm -f "$KEYCHAIN_PATH_PATH"
+# 証明書と出力ファイルを削除
+rm "$P12_PATH"
+rm "$CODESIGN_IDENTITY_PATH"
+rm "$KEYCHAIN_PATH_PATH"

@@ -425,15 +425,26 @@ jobs:
         run: |
           set -eu
 
-          CODESIGN_IDENTITY="$(head -n 1 /tmp/codesign_identity.txt)"
+          IDENTITY="$(head -n 1 /tmp/codesign_identity.txt)"
+
+          function codesign_file() {
+            TARGET="$1"
+            codesign --force --sign "$IDENTITY" --timestamp "$TARGET"
+          }
+
+          function is_signed() {
+            TARGET="$1"
+            codesign -dv "$TARGET" 2>&1 | grep -q "^Signature=adhoc" && return 1
+            codesign --verify "$TARGET" >/dev/null 2>&1 || return 1
+          }
+
           while IFS= read -r -d '' TARGET_FRAMEWORK; do
-            codesign \
-              --sign "$CODESIGN_IDENTITY" \
-              --force \
-              --all-architectures \
-              --timestamp \
-              --options=runtime \
-              "$TARGET_FRAMEWORK"
+            if is_signed "$TARGET_FRAMEWORK"; then
+              echo "署名済み: $TARGET_FRAMEWORK"
+            else
+              echo "署名開始: $TARGET_FRAMEWORK"
+              codesign_file "$TARGET_FRAMEWORK"
+            fi
           done < <(find dist/run -depth -type d -name "*.framework" -print0)
 
       # Because PyInstaller does not copy dynamic loaded libraries,
@@ -483,13 +494,11 @@ jobs:
             local DISPLAY_PATH="$2"
             shift 2
 
-            codesign --verify --strict --verbose=2 "$@" "$TARGET_PATH"
-            local SIGNATURE_INFO
-            SIGNATURE_INFO="$(codesign --display --verbose=4 "$TARGET_PATH" 2>&1)"
-            if echo "$SIGNATURE_INFO" | grep -q "^Signature=adhoc$"; then
+            if codesign -dv "$TARGET_PATH" 2>&1 | grep -q "^Signature=adhoc"; then
               echo "アドホック署名の対象があります: $DISPLAY_PATH"
               exit 1
             fi
+            codesign --verify "$@" "$TARGET_PATH"
             echo "署名を確認しました: $DISPLAY_PATH"
           }
 
@@ -524,7 +533,7 @@ jobs:
           done < <(find dist/run -type d -name "*.framework" -print0)
 
       - name: <Build> Code signing cleanup (macOS)
-        if: always() && inputs.code_signing == true && runner.os == 'macOS'
+        if: inputs.code_signing == true && runner.os == 'macOS'
         run: bash tools/codesign_cleanup.bash
         env:
           P12_PATH: /tmp/codesign.p12
