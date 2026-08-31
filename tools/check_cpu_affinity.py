@@ -1,0 +1,835 @@
+"""VOICEVOX ENGINE の CPU affinity を検証する。"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+import platform
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from subprocess import Popen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+import psutil
+
+_MODES = ("default", "thread-count", "affinity")
+_UNSUPPORTED_EXIT_CODE = 70
+_INCONCLUSIVE_EXIT_CODE = 71
+_REQUEST_TIMEOUT_SEC = 120.0
+_TEXT = "こんにちは、音声合成の CPU affinity 検証です"
+
+
+def main() -> int:
+    """CPU affinity の検証を実行する。"""
+    parser = _create_parser()
+    args = parser.parse_args()
+    engine_command = list(args.engine_command)
+    if engine_command and engine_command[0] == "--":
+        engine_command = engine_command[1:]
+    if not engine_command:
+        parser.error("Engine command を指定してください。例: -- python run.py")
+
+    output_path: Path = args.output_json
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path: Path = args.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        result = _run_trial(
+            mode=args.mode,
+            duration_sec=args.duration_sec,
+            warmup_count=args.warmup_count,
+            startup_timeout_sec=args.startup_timeout_sec,
+            log_path=log_path,
+            engine_command=engine_command,
+        )
+    except _UnsupportedError as error:
+        result = _failure_result(
+            base=_initial_result(args.mode),
+            details=error.details,
+            status="unsupported",
+            reason=error.reason,
+        )
+        _write_result(output_path, result)
+        return _UNSUPPORTED_EXIT_CODE
+    except _InconclusiveError as error:
+        result = _failure_result(
+            base=_initial_result(args.mode),
+            details=error.details,
+            status="inconclusive",
+            reason=error.reason,
+        )
+        _write_result(output_path, result)
+        return _INCONCLUSIVE_EXIT_CODE
+
+    _write_result(output_path, result)
+    if result["status"] == "verified":
+        return 0
+    return _INCONCLUSIVE_EXIT_CODE
+
+
+class _UnsupportedError(Exception):
+    def __init__(self, reason: str, details: dict[str, object]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.details = details
+
+
+class _InconclusiveError(Exception):
+    def __init__(self, reason: str, details: dict[str, object]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.details = details
+
+
+class _LinuxCpuSampler:
+    def __init__(self, pid: int) -> None:
+        self._pid = pid
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="cpu-sampler")
+        self._samples: list[dict[str, object]] = []
+        self._error: BaseException | None = None
+
+    def start(self) -> None:
+        self._record()
+        self._thread.start()
+
+    def stop(self) -> list[dict[str, object]]:
+        self._stop_event.set()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            raise RuntimeError(
+                "Linux の CPU サンプル取得スレッドを停止できませんでした。"
+            )
+        if self._error is not None:
+            raise RuntimeError(
+                "Linux の CPU サンプル取得に失敗しました。"
+            ) from self._error
+        return list(self._samples)
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_event.wait(0.01):
+                self._record()
+        except BaseException as error:
+            self._error = error
+
+    def _record(self) -> None:
+        self._samples.append(
+            {
+                "monotonic_sec": time.monotonic(),
+                "thread_cpu": _linux_thread_cpu_numbers(self._pid),
+            }
+        )
+
+
+def _create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="VOICEVOX ENGINE の CPU affinity を検証します。"
+    )
+    parser.add_argument("--mode", choices=_MODES, required=True)
+    parser.add_argument("--duration-sec", type=float, default=10.0)
+    parser.add_argument("--warmup-count", type=int, default=1)
+    parser.add_argument("--startup-timeout-sec", type=float, default=180.0)
+    parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument("--log-file", type=Path, required=True)
+    parser.add_argument("engine_command", nargs=argparse.REMAINDER)
+    return parser
+
+
+def _run_trial(
+    mode: str,
+    duration_sec: float,
+    warmup_count: int,
+    startup_timeout_sec: float,
+    log_path: Path,
+    engine_command: list[str],
+) -> dict[str, object]:
+    if mode not in _MODES:
+        raise ValueError(f"想定外の mode です: {mode}")
+    if duration_sec <= 0:
+        raise ValueError("duration-sec は正数で指定してください。")
+    if warmup_count < 0:
+        raise ValueError("warmup-count は0以上で指定してください。")
+    if startup_timeout_sec <= 0:
+        raise ValueError("startup-timeout-sec は正数で指定してください。")
+    result = _initial_result(mode)
+    system = platform.system()
+    original_cpu_set = _get_original_cpu_set()
+    result["original_cpu_set"] = original_cpu_set
+    if len(original_cpu_set) <= 1:
+        raise _UnsupportedError(
+            "使用可能な論理 CPU が一つしかないため検証できません。", result
+        )
+
+    excluded_cpu = max(original_cpu_set)
+    requested_cpu_set = [cpu for cpu in original_cpu_set if cpu != excluded_cpu]
+    result["excluded_cpu"] = excluded_cpu
+    result["requested_cpu_set"] = requested_cpu_set if mode != "default" else None
+    cpu_num_threads = len(requested_cpu_set) if mode != "default" else None
+    result["cpu_num_threads"] = cpu_num_threads
+
+    if mode == "affinity" and system == "Darwin":
+        raise _UnsupportedError(
+            "macOS では論理 CPU ID の affinity を設定できません。", result
+        )
+
+    port = _find_free_port()
+    result["port"] = port
+    command = _build_engine_command(engine_command, port, cpu_num_threads)
+    child_env = os.environ.copy()
+    if mode == "default":
+        child_env.pop("VV_CPU_NUM_THREADS", None)
+    child_env.pop("VV_USE_GPU", None)
+
+    process: subprocess.Popen[bytes] | None = None
+    engine_pid: int | None = None
+    sampler: _LinuxCpuSampler | None = None
+    try:
+        with open(log_path, "w", encoding="utf-8") as log_stream:
+            if mode == "affinity":
+                _set_current_cpu_set(requested_cpu_set)
+            try:
+                process = Popen(
+                    command,
+                    env=child_env,
+                    stdout=log_stream,
+                    stderr=subprocess.STDOUT,
+                )
+            finally:
+                if mode == "affinity":
+                    _set_current_cpu_set(original_cpu_set)
+
+            result["launcher_pid"] = process.pid
+            result["engine_version"] = _wait_for_version(
+                process, port, startup_timeout_sec
+            )
+            engine_pid = _find_engine_process_id(process.pid, engine_command)
+            result["engine_pid"] = engine_pid
+            thread_masks_after_core_initialization = _read_thread_masks(engine_pid)
+            result["thread_masks_after_core_initialization"] = (
+                thread_masks_after_core_initialization
+            )
+            result["configured_cpu_set"] = _configured_cpu_set(
+                engine_pid, thread_masks_after_core_initialization
+            )
+
+            if mode == "affinity":
+                _verify_process_affinity(result, requested_cpu_set)
+
+            query = _audio_query(port)
+            for _ in range(warmup_count):
+                _synthesis(port, query)
+            result["thread_masks_before_measurement"] = _read_thread_masks(engine_pid)
+
+            thread_cpu_before = _thread_cpu_times(engine_pid)
+            logical_cpu_before = _logical_cpu_times()
+            inference_durations: list[float] = []
+            inference_started = time.monotonic()
+            sampler = _start_linux_sampler(engine_pid)
+            while (
+                time.monotonic() - inference_started < duration_sec
+                or len(inference_durations) == 0
+            ):
+                request_started = time.monotonic()
+                _synthesis(port, query)
+                inference_durations.append(time.monotonic() - request_started)
+            linux_samples = _stop_linux_sampler(sampler)
+            sampler = None
+            result["thread_masks_after_measurement"] = _read_thread_masks(engine_pid)
+            thread_cpu_after = _thread_cpu_times(engine_pid)
+            logical_cpu_after = _logical_cpu_times()
+
+            result["thread_cpu_time"] = _thread_cpu_time_result(
+                thread_cpu_before, thread_cpu_after
+            )
+            result["logical_cpu_time_delta"] = _logical_cpu_time_delta(
+                logical_cpu_before, logical_cpu_after
+            )
+            result["linux_thread_execution_cpu_samples"] = linux_samples
+            result["inference_count"] = len(inference_durations)
+            result["inference_time_sec"] = {
+                "total": sum(inference_durations),
+                "minimum": min(inference_durations),
+                "maximum": max(inference_durations),
+                "per_request": inference_durations,
+            }
+            if mode == "affinity" and system == "Linux":
+                _verify_linux_affinity(result, requested_cpu_set)
+            result["status"] = "verified"
+            result["verified"] = True
+            result["unsupported"] = False
+            result["inconclusive"] = False
+            result["reason"] = _verified_reason(mode)
+    finally:
+        if sampler is not None:
+            _stop_linux_sampler(sampler)
+        if engine_pid is not None and process is not None and engine_pid != process.pid:
+            _terminate_process(engine_pid)
+        if process is not None:
+            _terminate_process(process.pid)
+            process.wait()
+    return result
+
+
+def _initial_result(mode: str) -> dict[str, object]:
+    return {
+        "environment": {
+            "os": platform.system(),
+            "architecture": platform.machine(),
+            "python": platform.python_version(),
+            "logical_cpu_count": psutil.cpu_count(logical=True),
+            "physical_cpu_count": psutil.cpu_count(logical=False),
+            "github_actions": _github_actions_environment(),
+        },
+        "mode": mode,
+        "engine_version": None,
+        "status": "inconclusive",
+        "verified": False,
+        "unsupported": False,
+        "inconclusive": True,
+        "original_cpu_set": None,
+        "requested_cpu_set": None,
+        "configured_cpu_set": None,
+        "excluded_cpu": None,
+        "cpu_num_threads": None,
+        "thread_masks_after_core_initialization": {},
+        "thread_masks_before_measurement": {},
+        "thread_masks_after_measurement": {},
+        "thread_cpu_time": {},
+        "logical_cpu_time_delta": {},
+        "linux_thread_execution_cpu_samples": [],
+        "inference_count": 0,
+        "inference_time_sec": {},
+    }
+
+
+def _github_actions_environment() -> dict[str, str]:
+    variables = ("RUNNER_OS", "RUNNER_ARCH", "RUNNER_NAME", "ImageOS")
+    environment: dict[str, str] = {}
+    for variable in variables:
+        value = os.environ.get(variable)
+        if value is not None:
+            environment[variable] = value
+    return environment
+
+
+def _failure_result(
+    base: dict[str, object],
+    details: dict[str, object],
+    status: str,
+    reason: str,
+) -> dict[str, object]:
+    result = {**base, **details}
+    result["status"] = status
+    result["verified"] = False
+    result["unsupported"] = status == "unsupported"
+    result["inconclusive"] = status == "inconclusive"
+    result["reason"] = reason
+    return result
+
+
+def _write_result(output_path: Path, result: dict[str, object]) -> None:
+    output_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _get_original_cpu_set() -> list[int]:
+    system = platform.system()
+    if system == "Linux":
+        return sorted(os.sched_getaffinity(0))
+    if system == "Windows":
+        return _windows_process_cpu_set(os.getpid())
+    if system == "Darwin":
+        cpu_count = os.cpu_count()
+        if cpu_count is None:
+            raise RuntimeError("macOS の論理 CPU 数を取得できませんでした。")
+        return list(range(cpu_count))
+    raise RuntimeError(f"対応していない OS です: {system}")
+
+
+def _set_current_cpu_set(cpu_set: list[int]) -> None:
+    if not cpu_set:
+        raise ValueError("affinity に空の CPU 集合は指定できません。")
+    system = platform.system()
+    if system == "Linux":
+        os.sched_setaffinity(0, set(cpu_set))
+        return
+    if system == "Windows":
+        _windows_set_current_process_cpu_set(cpu_set)
+        return
+    raise _UnsupportedError(
+        f"{system} では論理 CPU ID の affinity を設定できません。", {}
+    )
+
+
+def _build_engine_command(
+    engine_command: list[str], port: int, cpu_num_threads: int | None
+) -> list[str]:
+    managed_options = {
+        "--host",
+        "--port",
+        "--load_all_models",
+        "--cpu_num_threads",
+    }
+    for argument in engine_command:
+        option = argument.split("=", 1)[0]
+        if option in managed_options:
+            raise ValueError(f"Engine command に {option} を指定しないでください。")
+    command = list(engine_command)
+    command.extend(
+        [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--load_all_models",
+        ]
+    )
+    if cpu_num_threads is not None:
+        command.extend(["--cpu_num_threads", str(cpu_num_threads)])
+    return command
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_version(
+    process: subprocess.Popen[bytes], port: int, timeout_sec: float
+) -> str:
+    url = f"http://127.0.0.1:{port}/version"
+    deadline = time.monotonic() + timeout_sec
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Engine が起動前に終了しました。終了コード: {process.returncode}"
+            )
+        try:
+            response = _http_request(url=url, method="GET", body=None)
+            if response:
+                try:
+                    version = json.loads(response)
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(
+                        "Engine の version 応答を JSON として解釈できません。"
+                    ) from error
+                if not isinstance(version, str) or not version:
+                    raise RuntimeError("Engine の version 応答が文字列ではありません。")
+                return version
+            last_error = RuntimeError("Engine の version 応答が空でした。")
+        except (HTTPError, OSError, URLError) as error:
+            last_error = error
+        time.sleep(0.5)
+    if last_error is not None:
+        raise RuntimeError(
+            "Engine の起動を待機中にタイムアウトしました。"
+        ) from last_error
+    raise RuntimeError("Engine の起動を待機中にタイムアウトしました。")
+
+
+def _http_request(url: str, method: str, body: bytes | None) -> bytes:
+    request = Request(url, data=body, method=method)
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+    with urlopen(request, timeout=_REQUEST_TIMEOUT_SEC) as response:
+        body = response.read()
+    if not isinstance(body, bytes):
+        raise RuntimeError("HTTP 応答の body が bytes ではありません。")
+    return body
+
+
+def _audio_query(port: int) -> dict[str, object]:
+    query = _http_request(
+        url=(
+            f"http://127.0.0.1:{port}/audio_query?"
+            + urlencode({"speaker": "1", "text": _TEXT})
+        ),
+        method="POST",
+        body=None,
+    )
+    parsed = json.loads(query)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("audio_query の応答が JSON オブジェクトではありません。")
+    return parsed
+
+
+def _synthesis(port: int, query: dict[str, object]) -> None:
+    wave = _http_request(
+        url=f"http://127.0.0.1:{port}/synthesis?speaker=1",
+        method="POST",
+        body=json.dumps(query, ensure_ascii=False).encode("utf-8"),
+    )
+    if len(wave) < 44 or wave[:4] != b"RIFF":
+        raise RuntimeError("synthesis の応答が WAV ではありません。")
+
+
+def _find_engine_process_id(root_pid: int, command: list[str]) -> int:
+    expected_names = {
+        Path(part).name
+        for part in command
+        if part.endswith((".py", ".exe")) or Path(part).name in {"run", "run.exe"}
+    }
+    if not expected_names:
+        expected_names.add(Path(command[0]).name)
+    queue: list[tuple[psutil.Process, int]] = [(psutil.Process(root_pid), 0)]
+    candidates: list[tuple[int, int]] = []
+    visited: set[int] = set()
+    while queue:
+        process, depth = queue.pop(0)
+        if process.pid in visited:
+            continue
+        visited.add(process.pid)
+        try:
+            command_line = process.cmdline()
+        except psutil.NoSuchProcess:
+            continue
+        if not expected_names or any(
+            Path(part).name in expected_names for part in command_line
+        ):
+            candidates.append((process.pid, depth))
+        try:
+            children = process.children()
+        except psutil.NoSuchProcess:
+            children = []
+        queue.extend((child, depth + 1) for child in children)
+    if candidates:
+        return max(candidates, key=lambda candidate: candidate[1])[0]
+    raise RuntimeError("Engine プロセスを特定できませんでした。")
+
+
+def _read_thread_masks(pid: int) -> dict[str, list[int]] | dict[str, object]:
+    system = platform.system()
+    if system == "Linux":
+        return _linux_thread_masks(pid)
+    if system == "Windows":
+        return {"process": _windows_process_cpu_set(pid)}
+    return {}
+
+
+def _configured_cpu_set(
+    pid: int, thread_masks: dict[str, list[int]] | dict[str, object]
+) -> list[int] | None:
+    if platform.system() == "Linux":
+        main_mask = thread_masks.get(str(pid))
+        if not isinstance(main_mask, list):
+            raise RuntimeError(
+                "Engine のメインスレッド affinity を取得できませんでした。"
+            )
+        return main_mask
+    if platform.system() == "Windows":
+        return _windows_process_cpu_set(pid)
+    return None
+
+
+def _linux_thread_masks(pid: int) -> dict[str, list[int]]:
+    task_root = Path(f"/proc/{pid}/task")
+    masks: dict[str, list[int]] = {}
+    for task_dir in task_root.iterdir():
+        status = (task_dir / "status").read_text(encoding="utf-8")
+        for line in status.splitlines():
+            if line.startswith("Cpus_allowed_list:"):
+                masks[task_dir.name] = _parse_cpu_list(line.split(":", 1)[1].strip())
+                break
+        else:
+            raise RuntimeError(
+                f"TID {task_dir.name} の CPU affinity が見つかりません。"
+            )
+    return masks
+
+
+def _parse_cpu_list(value: str) -> list[int]:
+    cpus: set[int] = set()
+    for item in value.split(","):
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                raise RuntimeError(f"CPU 集合の範囲が不正です: {value}")
+            cpus.update(range(start, end + 1))
+        else:
+            cpus.add(int(item))
+    if not cpus:
+        raise RuntimeError(f"CPU 集合が空です: {value}")
+    return sorted(cpus)
+
+
+def _linux_thread_cpu_numbers(pid: int) -> dict[str, int]:
+    task_root = Path(f"/proc/{pid}/task")
+    cpu_numbers: dict[str, int] = {}
+    for task_dir in task_root.iterdir():
+        stat = (task_dir / "stat").read_text(encoding="utf-8")
+        closing_parenthesis = stat.rfind(")")
+        if closing_parenthesis < 0:
+            raise RuntimeError(f"TID {task_dir.name} の stat が不正です。")
+        fields = stat[closing_parenthesis + 2 :].split()
+        if len(fields) <= 36:
+            raise RuntimeError(
+                f"TID {task_dir.name} の stat フィールドが不足しています。"
+            )
+        cpu_numbers[task_dir.name] = int(fields[36])
+    return cpu_numbers
+
+
+def _thread_cpu_times(pid: int) -> dict[str, dict[str, float]]:
+    process = psutil.Process(pid)
+    return {
+        str(thread.id): {
+            "user_sec": float(thread.user_time),
+            "system_sec": float(thread.system_time),
+        }
+        for thread in process.threads()
+    }
+
+
+def _thread_cpu_time_result(
+    before: dict[str, dict[str, float]], after: dict[str, dict[str, float]]
+) -> dict[str, object]:
+    common_thread_ids = sorted(before.keys() & after.keys())
+    new_thread_ids = sorted(after.keys() - before.keys())
+    terminated_thread_ids = sorted(before.keys() - after.keys())
+    delta: dict[str, dict[str, float]] = {}
+    for tid in common_thread_ids:
+        before_time = before[tid]
+        after_time = after[tid]
+        delta[tid] = {
+            "user_sec": after_time["user_sec"] - before_time["user_sec"],
+            "system_sec": after_time["system_sec"] - before_time["system_sec"],
+        }
+    return {
+        "before": before,
+        "after": after,
+        "delta": delta,
+        "common_thread_ids": common_thread_ids,
+        "new_thread_ids": new_thread_ids,
+        "terminated_thread_ids": terminated_thread_ids,
+        "unavailable_thread_ids": terminated_thread_ids,
+    }
+
+
+def _logical_cpu_times() -> dict[str, dict[str, float]]:
+    cpu_times: dict[str, dict[str, float]] = {}
+    for cpu, times in enumerate(psutil.cpu_times(percpu=True)):
+        total_sec = float(sum(times))
+        total_sec -= float(getattr(times, "guest", 0.0))
+        total_sec -= float(getattr(times, "guest_nice", 0.0))
+        idle_sec = float(times.idle)
+        iowait_sec = float(getattr(times, "iowait", 0.0))
+        cpu_times[str(cpu)] = {
+            "user_sec": float(times.user),
+            "system_sec": float(times.system),
+            "idle_sec": idle_sec,
+            "total_sec": total_sec,
+            "busy_sec": total_sec - idle_sec - iowait_sec,
+        }
+    return cpu_times
+
+
+def _logical_cpu_time_delta(
+    before: dict[str, dict[str, float]], after: dict[str, dict[str, float]]
+) -> dict[str, dict[str, float]]:
+    if before.keys() != after.keys():
+        raise RuntimeError("論理 CPU の計測前後で CPU 集合が変化しました。")
+    fields = ("user_sec", "system_sec", "idle_sec", "total_sec", "busy_sec")
+    delta: dict[str, dict[str, float]] = {}
+    for cpu in sorted(before.keys() & after.keys()):
+        cpu_delta: dict[str, float] = {}
+        for field in fields:
+            value = after[cpu][field] - before[cpu][field]
+            if value < 0:
+                raise RuntimeError(
+                    f"論理 CPU {cpu} の {field} counter が逆行しました。"
+                )
+            cpu_delta[field] = value
+        total_sec = cpu_delta["total_sec"]
+        if total_sec <= 0:
+            raise RuntimeError(f"論理 CPU {cpu} の total_sec が正数ではありません。")
+        cpu_delta["busy_ratio"] = cpu_delta["busy_sec"] / total_sec
+        delta[cpu] = cpu_delta
+    return delta
+
+
+def _start_linux_sampler(pid: int) -> _LinuxCpuSampler | None:
+    if platform.system() != "Linux":
+        return None
+    sampler = _LinuxCpuSampler(pid)
+    sampler.start()
+    return sampler
+
+
+def _stop_linux_sampler(sampler: _LinuxCpuSampler | None) -> list[dict[str, object]]:
+    if sampler is None:
+        return []
+    return sampler.stop()
+
+
+def _verify_process_affinity(
+    result: dict[str, object], requested_cpu_set: list[int]
+) -> None:
+    configured_cpu_set = result["configured_cpu_set"]
+    if not isinstance(configured_cpu_set, list):
+        raise _InconclusiveError(
+            "子 Engine の process affinity を読み取れませんでした。", result
+        )
+    if configured_cpu_set != requested_cpu_set:
+        raise _InconclusiveError(
+            "子 Engine の process affinity が要求集合と一致しません。", result
+        )
+
+
+def _verify_linux_affinity(
+    result: dict[str, object], requested_cpu_set: list[int]
+) -> None:
+    requested_cpus = set(requested_cpu_set)
+    mask_fields = (
+        "thread_masks_after_core_initialization",
+        "thread_masks_before_measurement",
+        "thread_masks_after_measurement",
+    )
+    for mask_field in mask_fields:
+        masks = result[mask_field]
+        if not isinstance(masks, dict) or not masks:
+            raise _InconclusiveError(
+                f"Linux の {mask_field} を取得できませんでした。", result
+            )
+        for mask in masks.values():
+            if not isinstance(mask, list):
+                raise _InconclusiveError(
+                    f"Linux の {mask_field} の形式が不正です。", result
+                )
+            if set(mask) != requested_cpus:
+                raise _InconclusiveError(
+                    f"Linux の {mask_field} が要求集合と一致しません。", result
+                )
+    samples = result["linux_thread_execution_cpu_samples"]
+    if not isinstance(samples, list) or not samples:
+        raise _InconclusiveError(
+            "Linux の thread 実行 CPU サンプルがありません。", result
+        )
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise _InconclusiveError(
+                "Linux の thread 実行 CPU サンプルの形式が不正です。", result
+            )
+        thread_cpu = sample.get("thread_cpu")
+        if not isinstance(thread_cpu, dict):
+            raise _InconclusiveError(
+                "Linux の thread 実行 CPU サンプルの形式が不正です。", result
+            )
+        for cpu in thread_cpu.values():
+            if not isinstance(cpu, int) or cpu not in requested_cpus:
+                raise _InconclusiveError(
+                    "Linux の thread 実行 CPU サンプルに要求外 CPU が現れました。",
+                    result,
+                )
+
+
+def _verified_reason(mode: str) -> str:
+    if mode == "default":
+        return "affinity と cpu_num_threads を指定せず合成と計測が完了しました。"
+    if mode == "thread-count":
+        return "正数 cpu_num_threads を指定して合成と計測が完了しました。"
+    if mode == "affinity":
+        return "除外 CPU が thread mask と実行 CPU サンプルに現れませんでした。"
+    raise ValueError(f"想定外の mode です: {mode}")
+
+
+def _terminate_process(pid: int) -> None:
+    try:
+        process = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    if process.is_running():
+        process.terminate()
+    try:
+        process.wait(timeout=10.0)
+    except psutil.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10.0)
+
+
+def _windows_kernel32() -> ctypes.CDLL:
+    kernel32 = ctypes.CDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetActiveProcessorGroupCount.restype = ctypes.c_ushort
+    kernel32.GetLastError.restype = ctypes.c_uint32
+    kernel32.GetProcessAffinityMask.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel32.GetProcessAffinityMask.restype = ctypes.c_int
+    kernel32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    kernel32.SetProcessAffinityMask.restype = ctypes.c_int
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    return kernel32
+
+
+def _windows_error(kernel32: ctypes.CDLL) -> OSError:
+    error_code = int(kernel32.GetLastError())
+    return OSError(error_code, f"Windows API エラー: {error_code}")
+
+
+def _windows_process_cpu_set(pid: int) -> list[int]:
+    kernel32 = _windows_kernel32()
+    if kernel32.GetActiveProcessorGroupCount() > 1:
+        raise _UnsupportedError(
+            "複数の processor group を持つ Windows 環境は未対応です。", {}
+        )
+    current_pid = os.getpid()
+    if pid == current_pid:
+        handle = kernel32.GetCurrentProcess()
+        should_close = False
+    else:
+        handle = kernel32.OpenProcess(0x0400, 0, pid)
+        if not handle:
+            raise _windows_error(kernel32)
+        should_close = True
+    process_mask = ctypes.c_size_t()
+    system_mask = ctypes.c_size_t()
+    try:
+        if not kernel32.GetProcessAffinityMask(
+            handle, ctypes.byref(process_mask), ctypes.byref(system_mask)
+        ):
+            raise _windows_error(kernel32)
+        return [
+            bit
+            for bit in range(ctypes.sizeof(ctypes.c_size_t) * 8)
+            if process_mask.value & (1 << bit)
+        ]
+    finally:
+        if should_close and not kernel32.CloseHandle(handle):
+            raise _windows_error(kernel32)
+
+
+def _windows_set_current_process_cpu_set(cpu_set: list[int]) -> None:
+    kernel32 = _windows_kernel32()
+    mask = 0
+    for cpu in cpu_set:
+        if cpu < 0 or cpu >= ctypes.sizeof(ctypes.c_size_t) * 8:
+            raise ValueError(f"CPU ID が process affinity mask の範囲外です: {cpu}")
+        mask |= 1 << cpu
+    if not kernel32.SetProcessAffinityMask(
+        kernel32.GetCurrentProcess(), ctypes.c_size_t(mask)
+    ):
+        raise _windows_error(kernel32)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
