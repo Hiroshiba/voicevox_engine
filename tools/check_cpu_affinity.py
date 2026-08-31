@@ -230,7 +230,9 @@ def _run_trial(
                 _synthesis(port, query)
             result["thread_masks_before_measurement"] = _read_thread_masks(engine_pid)
 
-            thread_cpu_before = _thread_cpu_times(engine_pid)
+            if system != "Darwin":
+                thread_cpu_before = _thread_cpu_times(engine_pid)
+            process_cpu_before = _process_cpu_times(engine_pid)
             logical_cpu_before = _logical_cpu_times()
             inference_durations: list[float] = []
             inference_started = time.monotonic()
@@ -245,11 +247,20 @@ def _run_trial(
             linux_samples = _stop_linux_sampler(sampler)
             sampler = None
             result["thread_masks_after_measurement"] = _read_thread_masks(engine_pid)
-            thread_cpu_after = _thread_cpu_times(engine_pid)
+            if system != "Darwin":
+                thread_cpu_after = _thread_cpu_times(engine_pid)
+            process_cpu_after = _process_cpu_times(engine_pid)
             logical_cpu_after = _logical_cpu_times()
 
-            result["thread_cpu_time"] = _thread_cpu_time_result(
-                thread_cpu_before, thread_cpu_after
+            if system == "Darwin":
+                result["thread_cpu_time"] = _unsupported_thread_cpu_time()
+            else:
+                result["thread_cpu_time"] = _thread_cpu_time_result(
+                    thread_cpu_before,
+                    thread_cpu_after,
+                )
+            result["process_cpu_time"] = _process_cpu_time_result(
+                process_cpu_before, process_cpu_after
             )
             result["logical_cpu_time_delta"] = _logical_cpu_time_delta(
                 logical_cpu_before, logical_cpu_after
@@ -304,7 +315,10 @@ def _initial_result(mode: str) -> dict[str, object]:
         "thread_masks_after_core_initialization": {},
         "thread_masks_before_measurement": {},
         "thread_masks_after_measurement": {},
-        "thread_cpu_time": {},
+        "thread_cpu_time": (
+            _unsupported_thread_cpu_time() if platform.system() == "Darwin" else {}
+        ),
+        "process_cpu_time": {},
         "logical_cpu_time_delta": {},
         "linux_thread_execution_cpu_samples": [],
         "inference_count": 0,
@@ -610,6 +624,7 @@ def _thread_cpu_time_result(
             "system_sec": after_time["system_sec"] - before_time["system_sec"],
         }
     return {
+        "status": "supported",
         "before": before,
         "after": after,
         "delta": delta,
@@ -618,6 +633,34 @@ def _thread_cpu_time_result(
         "terminated_thread_ids": terminated_thread_ids,
         "unavailable_thread_ids": terminated_thread_ids,
     }
+
+
+def _unsupported_thread_cpu_time() -> dict[str, str]:
+    return {
+        "status": "unsupported",
+        "reason": "macOS では別プロセスの thread CPU 時間を取得できません。",
+    }
+
+
+def _process_cpu_times(pid: int) -> dict[str, float]:
+    process = psutil.Process(pid)
+    times = process.cpu_times()
+    return {
+        "user_sec": float(times.user),
+        "system_sec": float(times.system),
+    }
+
+
+def _process_cpu_time_result(
+    before: dict[str, float], after: dict[str, float]
+) -> dict[str, dict[str, float]]:
+    delta: dict[str, float] = {}
+    for field in ("user_sec", "system_sec"):
+        value = after[field] - before[field]
+        if value < 0:
+            raise RuntimeError(f"Engine process の {field} counter が逆行しました。")
+        delta[field] = value
+    return {"before": before, "after": after, "delta": delta}
 
 
 def _logical_cpu_times() -> dict[str, dict[str, float]]:
@@ -635,12 +678,16 @@ def _logical_cpu_times() -> dict[str, dict[str, float]]:
             "total_sec": total_sec,
             "busy_sec": total_sec - idle_sec - iowait_sec,
         }
+    if not cpu_times:
+        raise RuntimeError("論理 CPU の時間を取得できませんでした。")
     return cpu_times
 
 
 def _logical_cpu_time_delta(
     before: dict[str, dict[str, float]], after: dict[str, dict[str, float]]
 ) -> dict[str, dict[str, float]]:
+    if not before:
+        raise RuntimeError("論理 CPU の計測結果が空です。")
     if before.keys() != after.keys():
         raise RuntimeError("論理 CPU の計測前後で CPU 集合が変化しました。")
     fields = ("user_sec", "system_sec", "idle_sec", "total_sec", "busy_sec")
