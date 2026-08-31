@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      cpu_affinity:
+        description: "CPU affinity 実験だけを実行する"
+        type: boolean
+        required: false
+        default: false
 
 defaults:
   run:
@@ -11,6 +17,7 @@ defaults:
 
 jobs:
   test:
+    if: github.event_name != 'workflow_dispatch' || inputs.cpu_affinity != true
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -57,6 +64,7 @@ jobs:
         run: uv run typos
 
   lint-builders:
+    if: github.event_name != 'workflow_dispatch' || inputs.cpu_affinity != true
     runs-on: ubuntu-22.04
     steps:
       - name: <Setup> Check out the repository
@@ -83,3 +91,9 @@ jobs:
         with:
           fix: false
           min_age: "7"
+
+  cpu-affinity:
+    if: github.event_name == 'workflow_dispatch' && inputs.cpu_affinity == true
+    uses: ./.github/workflows/cpu-affinity.yml
+    permissions:
+      contents: read

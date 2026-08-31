@@ -1,0 +1,426 @@
+name: CPU affinity experiment
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  VOICEVOX_CORE_AND_DOWNLOADER_VERSION: "0.17.0"
+  VOICEVOX_ONNXRUNTIME_VERSION: "1.23.2"
+  VOICEVOX_VVM_VERSION: "0.17.0"
+
+jobs:
+  experiment:
+    name: CPU affinity (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            architecture: "x64"
+            target: linux-cpu-x64
+          - os: ubuntu-22.04-arm
+            architecture: "arm64"
+            target: linux-cpu-arm64
+          - os: windows-2022
+            architecture: "x64"
+            target: windows-cpu
+          - os: macos-15-intel
+            architecture: "x64"
+            target: macos-x64
+          - os: macos-14
+            architecture: "arm64"
+            target: macos-arm64
+
+    steps:
+      - name: <Setup> Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: <Setup> Prepare Python Runtime / Python Dependencies
+        uses: ./.github/actions/prepare_python
+        with:
+          dependency-group: dev
+
+      - name: <Setup> Download pyopenjtalk dictionary
+        run: |
+          set -euo pipefail
+          exit_code=1
+          for _ in $(seq 5); do
+            exit_code=0
+            uv run python -c "import pyopenjtalk; pyopenjtalk._lazy_init()" || exit_code=$?
+            if [[ "$exit_code" == 0 ]]; then
+              break
+            fi
+            sleep 5
+          done
+          exit "$exit_code"
+
+      - name: <Setup> Install ONNX Runtime dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y patchelf
+
+      - name: <Setup> Create download directory
+        run: mkdir -p download/core
+
+      - name: <Setup> Download Downloader
+        id: download-downloader
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS,$RUNNER_ARCH" in
+            Windows,X64) downloader_name=download-windows-x64.exe ;;
+            macOS,X64) downloader_name=download-osx-x64 ;;
+            macOS,ARM64) downloader_name=download-osx-arm64 ;;
+            Linux,X64) downloader_name=download-linux-x64 ;;
+            Linux,ARM64) downloader_name=download-linux-arm64 ;;
+            *)
+              echo "対応していない runner です: $RUNNER_OS,$RUNNER_ARCH" >&2
+              exit 1
+              ;;
+          esac
+
+          curl -fLO --retry 3 --retry-delay 5 \
+            --output-dir "$RUNNER_TEMP" \
+            "https://github.com/VOICEVOX/voicevox_core/releases/download/$VOICEVOX_CORE_AND_DOWNLOADER_VERSION/$downloader_name"
+
+          downloader_path="$RUNNER_TEMP/$downloader_name"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            downloader_path=$(cygpath "$downloader_path")
+          else
+            chmod +x "$downloader_path"
+          fi
+          echo "downloader-path=$downloader_path" >> "$GITHUB_OUTPUT"
+
+      - name: <Setup> Download CORE
+        env:
+          DOWNLOADER_PATH: ${{ steps.download-downloader.outputs.downloader-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          "$DOWNLOADER_PATH" \
+            --only c-api \
+            --c-api-version "$VOICEVOX_CORE_AND_DOWNLOADER_VERSION" \
+            --cpu-arch "${{ matrix.architecture }}" \
+            -o download/core
+
+      - name: <Setup> Download ONNX Runtime
+        env:
+          DOWNLOADER_PATH: ${{ steps.download-downloader.outputs.downloader-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          "$DOWNLOADER_PATH" \
+            --only onnxruntime \
+            --onnxruntime-version "$VOICEVOX_ONNXRUNTIME_VERSION" \
+            --onnxruntime-type voicevox-onnxruntime \
+            --devices cpu \
+            --cpu-arch "${{ matrix.architecture }}" \
+            -o download/core \
+            <<< y
+
+      - name: <Setup> Rename ONNX Runtime
+        run: |
+          set -euo pipefail
+          lib_dir=download/core/onnxruntime/lib
+          shopt -s nullglob
+          case "$RUNNER_OS" in
+            macOS)
+              runtime_files=("$lib_dir"/libvoicevox_onnxruntime.[1-9]*.dylib)
+              if [[ "${#runtime_files[@]}" -ne 1 ]]; then
+                echo "ONNX Runtime の macOS ライブラリが一つではありません。" >&2
+                exit 1
+              fi
+              mv -- "${runtime_files[0]}" "$lib_dir/libvoicevox_onnxruntime.dylib"
+              ;;
+            Linux)
+              runtime_files=("$lib_dir"/libvoicevox_onnxruntime.so.[1-9]*)
+              if [[ "${#runtime_files[@]}" -ne 1 ]]; then
+                echo "ONNX Runtime の Linux ライブラリが一つではありません。" >&2
+                exit 1
+              fi
+              mv -- "${runtime_files[0]}" "$lib_dir/libvoicevox_onnxruntime.so"
+              ;;
+            Windows)
+              test -f "$lib_dir/voicevox_onnxruntime.dll"
+              ;;
+            *)
+              echo "対応していない OS です: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: <Setup> Fix ONNX Runtime SONAME (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          patchelf \
+            --set-soname "libvoicevox_onnxruntime.so.$VOICEVOX_ONNXRUNTIME_VERSION" \
+            download/core/onnxruntime/lib/libvoicevox_onnxruntime.so
+
+      - name: <Setup> Download model 0.vvm
+        env:
+          DOWNLOADER_PATH: ${{ steps.download-downloader.outputs.downloader-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          "$DOWNLOADER_PATH" \
+            --only models \
+            --models-version "$VOICEVOX_VVM_VERSION" \
+            --models-pattern '0.vvm' \
+            -o download/core \
+            <<< y
+
+      - name: <Setup> Validate downloaded layout
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Windows)
+              core_library=download/core/c_api/lib/voicevox_core.dll
+              runtime_library=download/core/onnxruntime/lib/voicevox_onnxruntime.dll
+              ;;
+            macOS)
+              core_library=download/core/c_api/lib/libvoicevox_core.dylib
+              runtime_library=download/core/onnxruntime/lib/libvoicevox_onnxruntime.dylib
+              ;;
+            Linux)
+              core_library=download/core/c_api/lib/libvoicevox_core.so
+              runtime_library=download/core/onnxruntime/lib/libvoicevox_onnxruntime.so
+              ;;
+            *)
+              echo "対応していない OS です: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+          test -f "$core_library"
+          test -f "$runtime_library"
+          test -f download/core/models/vvms/0.vvm
+          shopt -s nullglob
+          vvm_files=(download/core/models/vvms/*.vvm)
+          if [[ "${#vvm_files[@]}" -ne 1 || "${vvm_files[0]}" != download/core/models/vvms/0.vvm ]]; then
+            echo "0.vvm 以外の VVM または VVM の欠落を検出しました。" >&2
+            exit 1
+          fi
+
+      - name: <Test> Run CPU affinity trials
+        run: |
+          set -euo pipefail
+          result_dir="$PWD/experiment-results"
+          exit_code_dir="$RUNNER_TEMP/cpu-affinity-exit-codes"
+          mkdir -p "$result_dir" "$exit_code_dir"
+
+          voicelib_dir="$PWD/download/core/c_api/lib"
+          runtime_dir="$PWD/download/core/onnxruntime/lib"
+          models_root_dir="$PWD/download/core/models/vvms"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            voicelib_dir=$(cygpath -m "$voicelib_dir")
+            runtime_dir=$(cygpath -m "$runtime_dir")
+            models_root_dir=$(cygpath -m "$models_root_dir")
+          fi
+          export VV_MODELS_ROOT_DIR="$models_root_dir"
+
+          case "$RUNNER_OS" in
+            Linux|macOS)
+              export LD_LIBRARY_PATH="$PWD/download/core/onnxruntime/lib:$PWD/download/core/c_api/lib"
+              if [[ "$RUNNER_OS" == macOS ]]; then
+                export DYLD_LIBRARY_PATH="$PWD/download/core/onnxruntime/lib:$PWD/download/core/c_api/lib"
+              fi
+              ;;
+            Windows)
+              ;;
+            *)
+              echo "対応していない OS です: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+
+          failures=0
+          for mode in default thread-count affinity; do
+            result_path="$result_dir/$mode.json"
+            log_path="$result_dir/$mode.log"
+            set +e
+            uv run python tools/check_cpu_affinity.py \
+              --mode "$mode" \
+              --duration-sec 10 \
+              --warmup-count 1 \
+              --output-json "$result_path" \
+              --log-file "$log_path" \
+              -- \
+              uv run python run.py \
+                --voicelib_dir "$voicelib_dir" \
+                --runtime_dir "$runtime_dir"
+            exit_code=$?
+            set -e
+            printf '%s\n' "$exit_code" > "$exit_code_dir/$mode.exit"
+
+            expected_exit_code=0
+            if [[ "$RUNNER_OS" == macOS && "$mode" == affinity ]]; then
+              expected_exit_code=70
+            fi
+            if [[ "$exit_code" -ne "$expected_exit_code" ]]; then
+              failures=1
+            fi
+          done
+          exit "$failures"
+
+      - name: <Test> Validate CPU affinity results
+        if: always()
+        run: |
+          set -u -o pipefail
+          result_dir="$PWD/experiment-results"
+          exit_code_dir="$RUNNER_TEMP/cpu-affinity-exit-codes"
+          failures=0
+
+          for mode in default thread-count affinity; do
+            result_path="$result_dir/$mode.json"
+            exit_path="$exit_code_dir/$mode.exit"
+            expected_exit_code=0
+            expected_status=verified
+            if [[ "$RUNNER_OS" == macOS && "$mode" == affinity ]]; then
+              expected_exit_code=70
+              expected_status=unsupported
+            fi
+
+            if [[ ! -f "$result_path" || ! -f "$exit_path" ]]; then
+              echo "結果 JSON または終了コードがありません: $mode" >&2
+              failures=1
+              continue
+            fi
+            if ! jq -e --arg mode "$mode" '.mode == $mode' "$result_path" >/dev/null; then
+              echo "結果 JSON の mode が不正です: $mode" >&2
+              failures=1
+            fi
+            if ! actual_exit_code=$(<"$exit_path"); then
+              echo "終了コードを読み取れません: $mode" >&2
+              failures=1
+            elif [[ "$actual_exit_code" != "$expected_exit_code" ]]; then
+              echo "終了コードが想定と異なります: $mode" >&2
+              failures=1
+            fi
+            if ! jq -e --arg status "$expected_status" '.status == $status' "$result_path" >/dev/null; then
+              echo "結果 JSON の status が想定と異なります: $mode" >&2
+              failures=1
+            fi
+            if [[ "$expected_status" == verified ]]; then
+              if ! jq -e '.verified == true and .unsupported == false and .inconclusive == false' "$result_path" >/dev/null; then
+                echo "検証済み結果のフラグが不正です: $mode" >&2
+                failures=1
+              fi
+            else
+              if ! jq -e '.verified == false and .unsupported == true and .inconclusive == false' "$result_path" >/dev/null; then
+                echo "非対応結果のフラグが不正です: $mode" >&2
+                failures=1
+              fi
+            fi
+            if [[ "$RUNNER_OS" != macOS ]]; then
+              if [[ "$mode" == affinity ]]; then
+                if ! jq -e '.configured_cpu_set == .requested_cpu_set' "$result_path" >/dev/null; then
+                  echo "affinity の設定後 CPU 集合が要求集合と一致しません: $mode" >&2
+                  failures=1
+                fi
+              elif ! jq -e '.configured_cpu_set == .original_cpu_set' "$result_path" >/dev/null; then
+                echo "設定なし mode の設定後 CPU 集合が元集合と一致しません: $mode" >&2
+                failures=1
+              fi
+            fi
+          done
+          exit "$failures"
+
+      - name: <Test> Write job summary
+        if: always()
+        run: |
+          set -u
+          result_dir="$PWD/experiment-results"
+
+          format_cpu_set() {
+            local result_path="$1"
+            local field="$2"
+            if [[ ! -f "$result_path" ]]; then
+              echo "結果なし"
+              return
+            fi
+            jq -r --arg field "$field" '
+              .[$field] as $value |
+              if $value == null then "なし"
+              elif ($value | type) == "array" then ($value | join(","))
+              else ($value | tostring)
+              end
+            ' "$result_path" 2>/dev/null || echo "取得失敗"
+          }
+
+          format_value() {
+            local result_path="$1"
+            local expression="$2"
+            if [[ ! -f "$result_path" ]]; then
+              echo "結果なし"
+              return
+            fi
+            jq -r "$expression" "$result_path" 2>/dev/null || echo "取得失敗"
+          }
+
+          format_busy_ratio() {
+            local result_path="$1"
+            if [[ ! -f "$result_path" ]]; then
+              echo "結果なし"
+              return
+            fi
+            jq -r '(.logical_cpu_time_delta // {}) | to_entries | map("\(.key)=\(.value.busy_ratio)") | join(", ")' "$result_path" 2>/dev/null || echo "取得失敗"
+          }
+
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            capability_status=unsupported
+          elif [[ -f "$result_dir/affinity.json" ]] && jq -e '.status == "verified"' "$result_dir/affinity.json" >/dev/null 2>&1; then
+            capability_status=verified
+          else
+            capability_status=inconclusive
+          fi
+
+          {
+            echo "## CPU affinity 実験"
+            echo
+            echo "- OS: $RUNNER_OS"
+            echo "- architecture: $RUNNER_ARCH"
+            echo "- runner: ${RUNNER_NAME:-不明}"
+            echo "- capability status: $capability_status"
+            echo "- Core: $VOICEVOX_CORE_AND_DOWNLOADER_VERSION"
+            echo "- VOICEVOX ONNX Runtime: $VOICEVOX_ONNXRUNTIME_VERSION"
+            echo "- VVM: $VOICEVOX_VVM_VERSION"
+            echo
+            echo "| mode | status | 元 CPU 集合 | 要求 CPU 集合 | 設定後 CPU 集合 | 除外 CPU | cpu_num_threads | 推論回数 | 推論時間 秒 | 論理 CPU ごとの busy ratio |"
+            echo "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |"
+            for mode in default thread-count affinity; do
+              result_path="$result_dir/$mode.json"
+              status=$(format_value "$result_path" '.status // "結果なし"')
+              original_cpu_set=$(format_cpu_set "$result_path" original_cpu_set)
+              requested_cpu_set=$(format_cpu_set "$result_path" requested_cpu_set)
+              configured_cpu_set=$(format_cpu_set "$result_path" configured_cpu_set)
+              excluded_cpu=$(format_value "$result_path" '.excluded_cpu // "なし"')
+              cpu_num_threads=$(format_value "$result_path" '.cpu_num_threads // "なし"')
+              inference_count=$(format_value "$result_path" '.inference_count // "なし"')
+              inference_time=$(format_value "$result_path" '.inference_time_sec.total // "なし"')
+              busy_ratio=$(format_busy_ratio "$result_path")
+              echo "| $mode | $status | $original_cpu_set | $requested_cpu_set | $configured_cpu_set | $excluded_cpu | $cpu_num_threads | $inference_count | $inference_time | $busy_ratio |"
+            done
+            echo
+            echo "システム全体の使用率は affinity の成功判定に使用せず、プロセスまたはスレッドの mask と実行 CPU の記録を判定に使用します。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: <Deploy> Upload CPU affinity results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cpu-affinity-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            experiment-results/*.json
+            experiment-results/*.log
+          if-no-files-found: error
+          retention-days: 3
