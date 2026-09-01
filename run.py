@@ -24,6 +24,11 @@ from voicevox_engine.setting.setting_manager import USER_SETTING_PATH, SettingHa
 from voicevox_engine.tts_pipeline.song_engine import make_song_engines_from_cores
 from voicevox_engine.tts_pipeline.tts_engine import make_tts_engines_from_cores
 from voicevox_engine.user_dict.user_dict_manager import UserDictionary
+from voicevox_engine.utility.cpu_affinity import (
+    CpuAffinityMode,
+    configure_cpu_affinity,
+    parse_cpu_affinity_mode,
+)
 from voicevox_engine.utility.path_utility import (
     engine_manifest_path,
     engine_root,
@@ -90,6 +95,7 @@ class Envs:
     host: str | None
     port: int | None
     use_gpu: bool
+    cpu_affinity_mode: CpuAffinityMode
 
 
 _env_adapter = TypeAdapter(Envs)
@@ -105,6 +111,7 @@ def read_environment_variables() -> Envs:
         host=os.getenv("VV_HOST"),
         port=decide_port_from_env("VV_PORT"),
         use_gpu=decide_boolean_from_env("VV_USE_GPU"),
+        cpu_affinity_mode=parse_cpu_affinity_mode(os.getenv("VV_CPU_AFFINITY_MODE")),
     )
     return _env_adapter.validate_python(asdict(envs))
 
@@ -347,13 +354,17 @@ def main() -> None:
         set_output_log_utf8()
 
     use_gpu = select_first_not_none([args.use_gpu, envs.use_gpu])
+    cpu_affinity = configure_cpu_affinity(
+        mode=envs.cpu_affinity_mode,
+        cpu_num_threads=args.cpu_num_threads,
+    )
 
     core_manager = initialize_cores(
         use_gpu=use_gpu,
         voicelib_dirs=args.voicelib_dirs,
         voicevox_dir=args.voicevox_dir,
         runtime_dirs=args.runtime_dirs,
-        cpu_num_threads=args.cpu_num_threads,
+        cpu_num_threads=cpu_affinity.cpu_num_threads,
         enable_mock=args.enable_mock,
         load_all_models=args.load_all_models,
     )
@@ -370,7 +381,7 @@ def main() -> None:
             voicelib_dirs=args.voicelib_dirs,
             voicevox_dir=args.voicevox_dir,
             runtime_dirs=args.runtime_dirs,
-            cpu_num_threads=args.cpu_num_threads,
+            cpu_num_threads=cpu_affinity.cpu_num_threads,
             enable_mock=args.enable_mock,
         )
 
