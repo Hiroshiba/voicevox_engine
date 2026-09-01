@@ -477,7 +477,10 @@ def _write_result(output_path: Path, result: dict[str, object]) -> None:
 def _read_observer_state() -> tuple[list[int] | None, dict[str, list[int]] | None]:
     system = platform.system()
     if system == "Linux":
-        return sorted(os.sched_getaffinity(0)), _linux_thread_masks(os.getpid())
+        return (
+            sorted(psutil.Process(os.getpid()).cpu_affinity()),
+            _linux_thread_masks(os.getpid()),
+        )
     if system == "Windows":
         return _windows_process_cpu_set(os.getpid()), None
     if system == "Darwin":

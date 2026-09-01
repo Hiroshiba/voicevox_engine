@@ -71,11 +71,11 @@ def test_configure_cpu_affinity_linux_excludes_maximum_cpu(
         return next(masks)
 
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_getaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_getaffinity",
         get_affinity,
     )
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_setaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_setaffinity",
         lambda pid, mask: set_calls.append((pid, set(mask))),
     )
 
@@ -104,11 +104,11 @@ def test_configure_cpu_affinity_linux_preserves_positive_thread_count(
         lambda: thread_ids,
     )
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_getaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_getaffinity",
         lambda pid: next(masks),
     )
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_setaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_setaffinity",
         lambda pid, mask: None,
     )
 
@@ -131,11 +131,11 @@ def test_configure_cpu_affinity_linux_rejects_mismatched_readback(
         lambda: thread_ids,
     )
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_getaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_getaffinity",
         lambda pid: next(masks),
     )
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_setaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_setaffinity",
         lambda pid, mask: None,
     )
 
@@ -173,11 +173,11 @@ def test_configure_cpu_affinity_linux_retries_when_new_thread_appears(
         return next(masks)
 
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_getaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_getaffinity",
         get_affinity,
     )
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_setaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_setaffinity",
         lambda pid, mask: set_calls.append((pid, set(mask))),
     )
 
@@ -218,11 +218,11 @@ def test_configure_cpu_affinity_linux_rejects_unstable_thread_set(
         lambda: next(thread_id_sequences),
     )
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_getaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_getaffinity",
         lambda pid: next(masks),
     )
     monkeypatch.setattr(
-        "voicevox_engine.utility.cpu_affinity.os.sched_setaffinity",
+        "voicevox_engine.utility.cpu_affinity._linux_sched_setaffinity",
         lambda pid, mask: set_calls.append((pid, set(mask))),
     )
 

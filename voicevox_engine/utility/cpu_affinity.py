@@ -7,9 +7,10 @@ import json
 import logging
 import os
 import platform
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 CpuAffinityMode = Literal["auto", "disabled"]
 CpuAffinityStatus = Literal["applied", "disabled", "unsupported"]
@@ -97,7 +98,7 @@ def configure_cpu_affinity(
 
 
 def _configure_linux(cpu_num_threads: int | None) -> CpuAffinityConfiguration:
-    original_cpu_set = tuple(sorted(os.sched_getaffinity(0)))
+    original_cpu_set = tuple(sorted(_linux_sched_getaffinity(0)))
     if len(original_cpu_set) <= 1:
         excluded_cpu = original_cpu_set[0] if len(original_cpu_set) == 1 else None
         return CpuAffinityConfiguration(
@@ -138,13 +139,13 @@ def _set_linux_thread_affinity(requested_cpu_set: tuple[int, ...]) -> None:
             thread_ids = _linux_thread_ids()
             requested_cpu_mask = set(requested_cpu_set)
             for thread_id in thread_ids:
-                os.sched_setaffinity(thread_id, requested_cpu_mask)
+                _linux_sched_setaffinity(thread_id, requested_cpu_mask)
 
             configured_thread_ids = _linux_thread_ids()
             if configured_thread_ids != thread_ids:
                 raise _LinuxThreadAffinityRace()
             for thread_id in configured_thread_ids:
-                configured_cpu_set = tuple(sorted(os.sched_getaffinity(thread_id)))
+                configured_cpu_set = tuple(sorted(_linux_sched_getaffinity(thread_id)))
                 if configured_cpu_set != requested_cpu_set:
                     raise RuntimeError(
                         "Linux の CPU affinity 設定後の CPU 集合が要求集合と一致しません。"
@@ -164,6 +165,18 @@ def _set_linux_thread_affinity(requested_cpu_set: tuple[int, ...]) -> None:
                     "Linux の全 TID への CPU affinity 設定が安定しません。"
                 ) from error
     raise RuntimeError("Linux の全 TID への CPU affinity 設定に失敗しました。")
+
+
+def _linux_sched_getaffinity(thread_id: int) -> set[int]:
+    sched_getaffinity = cast(Callable[[int], set[int]], vars(os)["sched_getaffinity"])
+    return sched_getaffinity(thread_id)
+
+
+def _linux_sched_setaffinity(thread_id: int, cpu_set: set[int]) -> None:
+    sched_setaffinity = cast(
+        Callable[[int, set[int]], None], vars(os)["sched_setaffinity"]
+    )
+    sched_setaffinity(thread_id, cpu_set)
 
 
 def _configure_windows(cpu_num_threads: int | None) -> CpuAffinityConfiguration:
