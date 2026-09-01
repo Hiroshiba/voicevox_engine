@@ -8,6 +8,7 @@ import logging
 import os
 import platform
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 CpuAffinityMode = Literal["auto", "disabled"]
@@ -15,6 +16,11 @@ CpuAffinityStatus = Literal["applied", "disabled", "unsupported"]
 
 _LOGGER = logging.getLogger(__name__)
 _CPU_AFFINITY_MODES = ("auto", "disabled")
+_LINUX_AFFINITY_RETRY_COUNT = 3
+
+
+class _LinuxThreadAffinityRace(Exception):
+    """Linux の TID 列挙競合。"""
 
 
 @dataclass(frozen=True)
@@ -107,24 +113,57 @@ def _configure_linux(cpu_num_threads: int | None) -> CpuAffinityConfiguration:
 
     excluded_cpu = original_cpu_set[-1]
     requested_cpu_set = original_cpu_set[:-1]
-    os.sched_setaffinity(0, set(requested_cpu_set))
-    configured_cpu_set = tuple(sorted(os.sched_getaffinity(0)))
-    if configured_cpu_set != requested_cpu_set:
-        raise RuntimeError(
-            "Linux の CPU affinity 設定後の CPU 集合が要求集合と一致しません。"
-        )
+    _set_linux_thread_affinity(requested_cpu_set)
     return CpuAffinityConfiguration(
         mode="auto",
         status="applied",
         original_cpu_set=original_cpu_set,
         requested_cpu_set=requested_cpu_set,
-        configured_cpu_set=configured_cpu_set,
+        configured_cpu_set=requested_cpu_set,
         excluded_cpu=excluded_cpu,
         cpu_num_threads=_normalized_cpu_num_threads(
             cpu_num_threads, len(requested_cpu_set)
         ),
         reason="最大 CPU ID を除外しました。",
     )
+
+
+def _linux_thread_ids() -> tuple[int, ...]:
+    return tuple(sorted(int(path.name) for path in Path("/proc/self/task").iterdir()))
+
+
+def _set_linux_thread_affinity(requested_cpu_set: tuple[int, ...]) -> None:
+    for attempt in range(_LINUX_AFFINITY_RETRY_COUNT):
+        try:
+            thread_ids = _linux_thread_ids()
+            requested_cpu_mask = set(requested_cpu_set)
+            for thread_id in thread_ids:
+                os.sched_setaffinity(thread_id, requested_cpu_mask)
+
+            configured_thread_ids = _linux_thread_ids()
+            if configured_thread_ids != thread_ids:
+                raise _LinuxThreadAffinityRace()
+            for thread_id in configured_thread_ids:
+                configured_cpu_set = tuple(sorted(os.sched_getaffinity(thread_id)))
+                if configured_cpu_set != requested_cpu_set:
+                    raise RuntimeError(
+                        "Linux の CPU affinity 設定後の CPU 集合が要求集合と一致しません。"
+                    )
+
+            final_thread_ids = _linux_thread_ids()
+            if final_thread_ids != configured_thread_ids:
+                raise _LinuxThreadAffinityRace()
+            return
+        except (
+            _LinuxThreadAffinityRace,
+            FileNotFoundError,
+            ProcessLookupError,
+        ) as error:
+            if attempt == _LINUX_AFFINITY_RETRY_COUNT - 1:
+                raise RuntimeError(
+                    "Linux の全 TID への CPU affinity 設定が安定しません。"
+                ) from error
+    raise RuntimeError("Linux の全 TID への CPU affinity 設定に失敗しました。")
 
 
 def _configure_windows(cpu_num_threads: int | None) -> CpuAffinityConfiguration:
@@ -236,11 +275,14 @@ def _windows_error(kernel32: ctypes.CDLL) -> OSError:
 def _windows_process_cpu_set(kernel32: ctypes.CDLL) -> tuple[int, ...]:
     process_mask = ctypes.c_size_t()
     system_mask = ctypes.c_size_t()
-    if kernel32.GetProcessAffinityMask(
-        kernel32.GetCurrentProcess(),
-        ctypes.byref(process_mask),
-        ctypes.byref(system_mask),
-    ) == 0:
+    if (
+        kernel32.GetProcessAffinityMask(
+            kernel32.GetCurrentProcess(),
+            ctypes.byref(process_mask),
+            ctypes.byref(system_mask),
+        )
+        == 0
+    ):
         raise _windows_error(kernel32)
     return tuple(
         bit
@@ -258,7 +300,10 @@ def _windows_set_process_cpu_set(
         if cpu < 0 or cpu >= bit_count:
             raise ValueError(f"CPU ID が process affinity mask の範囲外です: {cpu}")
         mask |= 1 << cpu
-    if kernel32.SetProcessAffinityMask(
-        kernel32.GetCurrentProcess(), ctypes.c_size_t(mask)
-    ) == 0:
+    if (
+        kernel32.SetProcessAffinityMask(
+            kernel32.GetCurrentProcess(), ctypes.c_size_t(mask)
+        )
+        == 0
+    ):
         raise _windows_error(kernel32)
