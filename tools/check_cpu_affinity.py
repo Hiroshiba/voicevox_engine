@@ -120,10 +120,11 @@ class _LinuxCpuSampler:
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, name="cpu-sampler")
         self._samples: list[dict[str, object]] = []
+        self._previous_stats: dict[str, tuple[int, int]] = {}
         self._error: BaseException | None = None
 
     def start(self) -> None:
-        self._record()
+        self._previous_stats = _linux_thread_stats(self._pid)
         self._thread.start()
 
     def stop(self) -> list[dict[str, object]]:
@@ -147,10 +148,24 @@ class _LinuxCpuSampler:
             self._error = error
 
     def _record(self) -> None:
+        current_stats = _linux_thread_stats(self._pid)
+        active_thread_cpu: dict[str, int] = {}
+        for tid, (ticks, processor) in current_stats.items():
+            previous = self._previous_stats.get(tid)
+            if previous is None:
+                continue
+            previous_ticks = previous[0]
+            if ticks < previous_ticks:
+                raise RuntimeError(f"TID {tid} の CPU 時間 tick が逆行しました。")
+            if ticks > previous_ticks:
+                active_thread_cpu[tid] = processor
+        self._previous_stats = current_stats
+        if len(active_thread_cpu) == 0:
+            return
         self._samples.append(
             {
                 "monotonic_sec": time.monotonic(),
-                "thread_cpu": _linux_thread_cpu_numbers(self._pid),
+                "thread_cpu": active_thread_cpu,
             }
         )
 
@@ -883,9 +898,9 @@ def _parse_cpu_list(value: str) -> list[int]:
     return sorted(cpus)
 
 
-def _linux_thread_cpu_numbers(pid: int) -> dict[str, int]:
+def _linux_thread_stats(pid: int) -> dict[str, tuple[int, int]]:
     task_root = Path(f"/proc/{pid}/task")
-    cpu_numbers: dict[str, int] = {}
+    thread_stats: dict[str, tuple[int, int]] = {}
     for task_dir in task_root.iterdir():
         stat = (task_dir / "stat").read_text(encoding="utf-8")
         closing_parenthesis = stat.rfind(")")
@@ -896,8 +911,15 @@ def _linux_thread_cpu_numbers(pid: int) -> dict[str, int]:
             raise RuntimeError(
                 f"TID {task_dir.name} の stat フィールドが不足しています。"
             )
-        cpu_numbers[task_dir.name] = int(fields[36])
-    return cpu_numbers
+        try:
+            ticks = int(fields[11]) + int(fields[12])
+            processor = int(fields[36])
+        except ValueError as error:
+            raise RuntimeError(f"TID {task_dir.name} の stat が不正です。") from error
+        if ticks < 0:
+            raise RuntimeError(f"TID {task_dir.name} の CPU 時間 tick が負数です。")
+        thread_stats[task_dir.name] = (ticks, processor)
+    return thread_stats
 
 
 def _thread_cpu_times(pid: int) -> dict[str, dict[str, float]]:
@@ -1064,6 +1086,10 @@ def _verify_linux_affinity(
             raise _InconclusiveError(
                 "Linux の thread 実行 CPU サンプルの形式が不正です。", result
             )
+        if len(thread_cpu) == 0:
+            raise _InconclusiveError(
+                "Linux の thread 実行 CPU サンプルが空です。", result
+            )
         for cpu in thread_cpu.values():
             if (
                 not isinstance(cpu, int)
@@ -1116,7 +1142,7 @@ def _verified_reason(mode: str) -> str:
     if mode == "thread-count":
         return "VV_CPU_AFFINITY_MODE=disabled を渡して CPU affinity を比較用に無効化し、正数 cpu_num_threads を指定して合成と計測が完了しました。"
     if mode == "affinity":
-        return "Engine 自身が設定した CPU affinity が要求集合と一致し、除外 CPU が thread mask と実行 CPU サンプルに現れませんでした。"
+        return "Engine 自身が設定した CPU affinity が要求集合と一致し、CPU 時間 tick が増加した TID の実行 CPU サンプルにも除外 CPU が現れませんでした。"
     raise ValueError(f"想定外の mode です: {mode}")
 
 
