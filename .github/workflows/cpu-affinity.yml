@@ -19,7 +19,7 @@ jobs:
   experiment:
     name: CPU affinity (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -47,7 +47,7 @@ jobs:
       - name: <Setup> Prepare Python Runtime / Python Dependencies
         uses: ./.github/actions/prepare_python
         with:
-          dependency-group: dev
+          dependency-group: build
 
       - name: <Setup> Download pyopenjtalk dictionary
         run: |
@@ -211,31 +211,24 @@ jobs:
             exit 1
           fi
 
-      - name: <Test> Run CPU affinity trials
+      - name: <Build> Generate resource filemap
+        run: uv run tools/generate_filemap.py --target_dir resources/character_info
+
+      - name: <Build> Build VOICEVOX ENGINE executable
         run: |
           set -euo pipefail
-          result_dir="$PWD/experiment-results"
-          exit_code_dir="$RUNNER_TEMP/cpu-affinity-exit-codes"
-          mkdir -p "$result_dir" "$exit_code_dir"
-
-          voicelib_dir="$PWD/download/core/c_api/lib"
-          runtime_dir="$PWD/download/core/onnxruntime/lib"
-          models_root_dir="$PWD/download/core/models/vvms"
-          if [[ "$RUNNER_OS" == Windows ]]; then
-            voicelib_dir=$(cygpath -m "$voicelib_dir")
-            runtime_dir=$(cygpath -m "$runtime_dir")
-            models_root_dir=$(cygpath -m "$models_root_dir")
-          fi
-          export VV_MODELS_ROOT_DIR="$models_root_dir"
-
           case "$RUNNER_OS" in
-            Linux|macOS)
-              export LD_LIBRARY_PATH="$PWD/download/core/onnxruntime/lib:$PWD/download/core/c_api/lib"
-              if [[ "$RUNNER_OS" == macOS ]]; then
-                export DYLD_LIBRARY_PATH="$PWD/download/core/onnxruntime/lib:$PWD/download/core/c_api/lib"
-              fi
-              ;;
             Windows)
+              libcore_path=download/core/c_api/lib/voicevox_core.dll
+              libonnxruntime_path=download/core/onnxruntime/lib/voicevox_onnxruntime.dll
+              ;;
+            macOS)
+              libcore_path=download/core/c_api/lib/libvoicevox_core.dylib
+              libonnxruntime_path=download/core/onnxruntime/lib/libvoicevox_onnxruntime.dylib
+              ;;
+            Linux)
+              libcore_path=download/core/c_api/lib/libvoicevox_core.so
+              libonnxruntime_path=download/core/onnxruntime/lib/libvoicevox_onnxruntime.so
               ;;
             *)
               echo "対応していない OS です: $RUNNER_OS" >&2
@@ -243,32 +236,154 @@ jobs:
               ;;
           esac
 
-          failures=0
-          for mode in default thread-count affinity; do
-            result_path="$result_dir/$mode.json"
-            log_path="$result_dir/$mode.log"
-            set +e
-            uv run python tools/check_cpu_affinity.py \
-              --mode "$mode" \
-              --duration-sec 10 \
-              --warmup-count 1 \
-              --output-json "$result_path" \
-              --log-file "$log_path" \
-              -- \
-              uv run python run.py \
-                --voicelib_dir "$voicelib_dir" \
-                --runtime_dir "$runtime_dir"
-            exit_code=$?
-            set -e
-            printf '%s\n' "$exit_code" > "$exit_code_dir/$mode.exit"
+          uv run pyinstaller --noconfirm run.spec -- \
+            --libcore_path="$libcore_path" \
+            --libonnxruntime_path="$libonnxruntime_path" \
+            --core_model_dir_path="download/core/models/vvms"
 
-            expected_exit_code=0
-            if [[ "$RUNNER_OS" == macOS && "$mode" == affinity ]]; then
-              expected_exit_code=70
+      - name: <Test> Validate PyInstaller package
+        run: |
+          set -euo pipefail
+          package_dir="$PWD/dist/run"
+          test -d "$package_dir"
+          case "$RUNNER_OS" in
+            Windows)
+              engine_file="$package_dir/run.exe"
+              core_file="$package_dir/voicevox_core.dll"
+              runtime_file="$package_dir/voicevox_onnxruntime.dll"
+              ;;
+            macOS)
+              engine_file="$package_dir/run"
+              core_file="$package_dir/libvoicevox_core.dylib"
+              runtime_file="$package_dir/libvoicevox_onnxruntime.dylib"
+              chmod +x "$engine_file"
+              ;;
+            Linux)
+              engine_file="$package_dir/run"
+              core_file="$package_dir/libvoicevox_core.so"
+              runtime_file="$package_dir/libvoicevox_onnxruntime.so"
+              chmod +x "$engine_file"
+              ;;
+            *)
+              echo "対応していない OS です: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+          test -f "$engine_file"
+          test -x "$engine_file" || [[ "$RUNNER_OS" == Windows ]]
+          test -f "$core_file"
+          test -f "$runtime_file"
+          test -f "$package_dir/engine_manifest.json"
+          test -d "$package_dir/resources"
+          test -f "$package_dir/model/0.vvm"
+          shopt -s nullglob
+          model_files=("$package_dir/model"/*.vvm)
+          if [[ "${#model_files[@]}" -ne 1 || "${model_files[0]}" != "$package_dir/model/0.vvm" ]]; then
+            echo "PyInstaller package に 0.vvm 以外の VVM または VVM の欠落を検出しました。" >&2
+            exit 1
+          fi
+
+      - name: <Test> Run CPU affinity trials
+        run: |
+          set -euo pipefail
+          repository_root="$PWD"
+          result_dir="$repository_root/experiment-results"
+          exit_code_dir="$RUNNER_TEMP/cpu-affinity-exit-codes"
+          mkdir -p "$result_dir" "$exit_code_dir"
+
+          to_python_path() {
+            if [[ "$RUNNER_OS" == Windows ]]; then
+              cygpath -m "$1"
+            else
+              printf '%s\n' "$1"
             fi
-            if [[ "$exit_code" -ne "$expected_exit_code" ]]; then
-              failures=1
+          }
+
+          repository_root_for_python=$(to_python_path "$repository_root")
+          checker_path_for_python=$(to_python_path "$repository_root/tools/check_cpu_affinity.py")
+          source_engine_path=$(to_python_path "$repository_root/run.py")
+          source_voicelib_dir=$(to_python_path "$repository_root/download/core/c_api/lib")
+          source_runtime_dir=$(to_python_path "$repository_root/download/core/onnxruntime/lib")
+          source_models_root_dir=$(to_python_path "$repository_root/download/core/models/vvms")
+          package_dir="$repository_root/dist/run"
+          package_dir_for_python=$(to_python_path "$package_dir")
+          package_models_root_dir=$(to_python_path "$package_dir/model")
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            package_engine_path=$(to_python_path "$package_dir/run.exe")
+          else
+            package_engine_path=$(to_python_path "$package_dir/run")
+          fi
+
+          failures=0
+          for launch_format in python pyinstaller; do
+            if [[ "$launch_format" == python ]]; then
+              engine_cwd="$repository_root_for_python"
+              models_root_dir="$source_models_root_dir"
+              library_dir="$source_runtime_dir:$source_voicelib_dir"
+              engine_command=(
+                uv run
+                --project "$repository_root_for_python"
+                python "$source_engine_path"
+                --voicelib_dir "$source_voicelib_dir"
+                --runtime_dir "$source_runtime_dir"
+              )
+            elif [[ "$launch_format" == pyinstaller ]]; then
+              engine_cwd="$package_dir_for_python"
+              models_root_dir="$package_models_root_dir"
+              library_dir="$package_dir_for_python"
+              engine_command=("$package_engine_path")
+            else
+              echo "対応していない launch format です: $launch_format" >&2
+              exit 1
             fi
+
+            for mode in default thread-count affinity; do
+              result_path="$result_dir/$launch_format/$mode.json"
+              log_path="$result_dir/$launch_format/$mode.log"
+              mkdir -p "$(dirname "$result_path")"
+              env_args=("VV_MODELS_ROOT_DIR=$models_root_dir")
+              case "$RUNNER_OS" in
+                Linux)
+                  env_args+=("LD_LIBRARY_PATH=$library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+                  ;;
+                macOS)
+                  env_args+=("DYLD_LIBRARY_PATH=$library_dir${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}")
+                  ;;
+                Windows)
+                  ;;
+                *)
+                  echo "対応していない OS です: $RUNNER_OS" >&2
+                  exit 1
+                  ;;
+              esac
+
+              set +e
+              env "${env_args[@]}" \
+                uv run \
+                --project "$repository_root_for_python" \
+                python "$checker_path_for_python" \
+                --mode "$mode" \
+                --duration-sec 10 \
+                --warmup-count 1 \
+                --launch-format "$launch_format" \
+                --engine-cwd "$engine_cwd" \
+                --output-json "$(to_python_path "$result_path")" \
+                --log-file "$(to_python_path "$log_path")" \
+                -- \
+                "${engine_command[@]}"
+              exit_code=$?
+              set -e
+              printf '%s\n' "$exit_code" > "$exit_code_dir/$launch_format-$mode.exit"
+
+              expected_exit_code=0
+              if [[ "$RUNNER_OS" == macOS && "$mode" == affinity ]]; then
+                expected_exit_code=70
+              fi
+              if [[ "$exit_code" -ne "$expected_exit_code" ]]; then
+                echo "$launch_format/$mode の終了コードが想定と異なります: $exit_code" >&2
+                failures=1
+              fi
+            done
           done
           exit "$failures"
 
@@ -280,58 +395,168 @@ jobs:
           exit_code_dir="$RUNNER_TEMP/cpu-affinity-exit-codes"
           failures=0
 
-          for mode in default thread-count affinity; do
-            result_path="$result_dir/$mode.json"
-            exit_path="$exit_code_dir/$mode.exit"
-            expected_exit_code=0
-            expected_status=verified
-            if [[ "$RUNNER_OS" == macOS && "$mode" == affinity ]]; then
-              expected_exit_code=70
-              expected_status=unsupported
-            fi
+          for launch_format in python pyinstaller; do
+            for mode in default thread-count affinity; do
+              result_path="$result_dir/$launch_format/$mode.json"
+              exit_path="$exit_code_dir/$launch_format-$mode.exit"
+              expected_exit_code=0
+              expected_status=verified
+              if [[ "$RUNNER_OS" == macOS && "$mode" == affinity ]]; then
+                expected_exit_code=70
+                expected_status=unsupported
+              fi
 
-            if [[ ! -f "$result_path" || ! -f "$exit_path" ]]; then
-              echo "結果 JSON または終了コードがありません: $mode" >&2
-              failures=1
-              continue
-            fi
-            if ! jq -e --arg mode "$mode" '.mode == $mode' "$result_path" >/dev/null; then
-              echo "結果 JSON の mode が不正です: $mode" >&2
-              failures=1
-            fi
-            if ! actual_exit_code=$(<"$exit_path"); then
-              echo "終了コードを読み取れません: $mode" >&2
-              failures=1
-            elif [[ "$actual_exit_code" != "$expected_exit_code" ]]; then
-              echo "終了コードが想定と異なります: $mode" >&2
-              failures=1
-            fi
-            if ! jq -e --arg status "$expected_status" '.status == $status' "$result_path" >/dev/null; then
-              echo "結果 JSON の status が想定と異なります: $mode" >&2
-              failures=1
-            fi
-            if [[ "$expected_status" == verified ]]; then
-              if ! jq -e '.verified == true and .unsupported == false and .inconclusive == false' "$result_path" >/dev/null; then
-                echo "検証済み結果のフラグが不正です: $mode" >&2
+              if [[ ! -f "$result_path" || ! -f "$exit_path" ]]; then
+                echo "結果 JSON または終了コードがありません: $launch_format/$mode" >&2
+                failures=1
+                continue
+              fi
+
+              if ! actual_exit_code=$(<"$exit_path"); then
+                echo "終了コードを読み取れません: $launch_format/$mode" >&2
+                failures=1
+              elif [[ "$actual_exit_code" != "$expected_exit_code" ]]; then
+                echo "終了コードが想定と異なります: $launch_format/$mode" >&2
                 failures=1
               fi
-            else
-              if ! jq -e '.verified == false and .unsupported == true and .inconclusive == false' "$result_path" >/dev/null; then
-                echo "非対応結果のフラグが不正です: $mode" >&2
+
+              if ! jq -e --arg mode "$mode" --arg launch_format "$launch_format" --arg status "$expected_status" '
+                .mode == $mode and
+                .launch_format == $launch_format and
+                .status == $status and
+                (.verified == ($status == "verified")) and
+                (.unsupported == ($status == "unsupported")) and
+                (.inconclusive == false)
+              ' "$result_path" >/dev/null; then
+                echo "結果 JSON の基本項目が不正です: $launch_format/$mode" >&2
                 failures=1
               fi
-            fi
-            if [[ "$RUNNER_OS" != macOS ]]; then
-              if [[ "$mode" == affinity ]]; then
-                if ! jq -e '.configured_cpu_set == .requested_cpu_set' "$result_path" >/dev/null; then
-                  echo "affinity の設定後 CPU 集合が要求集合と一致しません: $mode" >&2
+
+              if ! jq -e '
+                . as $result |
+                ($result.original_cpu_set | type == "array" and length >= 2) and
+                ($result.observer_cpu_sets | type == "object") and
+                (["before_launch", "after_popen", "after_core_initialization", "after_measurement", "after_engine_exit"]
+                  | all(.[]; . as $phase | $result.observer_cpu_sets[$phase] == $result.original_cpu_set))
+              ' "$result_path" >/dev/null; then
+                echo "observer の CPU 集合が全 phase で不変ではありません: $launch_format/$mode" >&2
+                failures=1
+              fi
+
+              if ! jq -e '
+                . as $result |
+                ($result.cpu_affinity_event | type == "object") and
+                ($result.cpu_affinity_event.event == "cpu_affinity") and
+                (
+                  if $result.mode == "default" then
+                    $result.requested_cpu_set == null and
+                    $result.excluded_cpu == ($result.original_cpu_set | max) and
+                    $result.command_cpu_num_threads == null and
+                    $result.engine_cpu_num_threads == null and
+                    $result.cpu_num_threads == null and
+                    $result.cpu_affinity_event.mode == "disabled" and
+                    $result.cpu_affinity_event.state == "disabled" and
+                    $result.cpu_affinity_event.original_cpu_set == null and
+                    $result.cpu_affinity_event.requested_cpu_set == null and
+                    $result.cpu_affinity_event.configured_cpu_set == null and
+                    $result.cpu_affinity_event.excluded_cpu == null and
+                    $result.cpu_affinity_event.cpu_num_threads == null
+                  elif $result.mode == "thread-count" then
+                    ($result.requested_cpu_set | length) == $result.command_cpu_num_threads and
+                    $result.engine_cpu_num_threads == $result.command_cpu_num_threads and
+                    $result.cpu_num_threads == $result.engine_cpu_num_threads and
+                    $result.cpu_affinity_event.mode == "disabled" and
+                    $result.cpu_affinity_event.state == "disabled" and
+                    $result.cpu_affinity_event.original_cpu_set == null and
+                    $result.cpu_affinity_event.requested_cpu_set == null and
+                    $result.cpu_affinity_event.configured_cpu_set == null and
+                    $result.cpu_affinity_event.excluded_cpu == null and
+                    $result.cpu_affinity_event.cpu_num_threads == $result.command_cpu_num_threads
+                  elif $result.mode == "affinity" then
+                    $result.command_cpu_num_threads == null and
+                    $result.engine_cpu_num_threads == $result.cpu_affinity_event.cpu_num_threads and
+                    $result.cpu_num_threads == $result.engine_cpu_num_threads and
+                    $result.cpu_affinity_event.mode == "auto" and
+                    (
+                      if $result.environment.os == "Darwin" then
+                        $result.cpu_affinity_event.state == "unsupported" and
+                        $result.cpu_affinity_event.original_cpu_set == null and
+                        $result.cpu_affinity_event.requested_cpu_set == null and
+                        $result.cpu_affinity_event.configured_cpu_set == null and
+                        $result.cpu_affinity_event.excluded_cpu == null and
+                        $result.cpu_affinity_event.cpu_num_threads == null
+                      else
+                        $result.cpu_affinity_event.state == "applied" and
+                        $result.cpu_affinity_event.original_cpu_set == $result.original_cpu_set and
+                        $result.cpu_affinity_event.requested_cpu_set == $result.requested_cpu_set and
+                        $result.cpu_affinity_event.configured_cpu_set == $result.requested_cpu_set and
+                        $result.cpu_affinity_event.excluded_cpu == $result.excluded_cpu and
+                        $result.cpu_affinity_event.cpu_num_threads == ($result.requested_cpu_set | length)
+                      end
+                    )
+                  else false
+                  end
+                )
+              ' "$result_path" >/dev/null; then
+                echo "cpu_affinity 診断イベントまたは thread 数が不正です: $launch_format/$mode" >&2
+                failures=1
+              fi
+
+              if ! jq -e '
+                . as $result |
+                if .mode == "default" then
+                  .requested_cpu_set == null and
+                  .excluded_cpu == (.original_cpu_set | max)
+                else
+                  .requested_cpu_set == (.original_cpu_set[:-1]) and
+                  .excluded_cpu == (.original_cpu_set | max)
+                end
+              ' "$result_path" >/dev/null; then
+                echo "要求 CPU 集合または除外 CPU が不正です: $launch_format/$mode" >&2
+                failures=1
+              fi
+
+              if [[ "$RUNNER_OS" != macOS ]]; then
+                if [[ "$mode" == affinity ]]; then
+                  if ! jq -e '.configured_cpu_set == .requested_cpu_set' "$result_path" >/dev/null; then
+                    echo "affinity の設定後 CPU 集合が要求集合と一致しません: $launch_format/$mode" >&2
+                    failures=1
+                  fi
+                elif ! jq -e '.configured_cpu_set == .original_cpu_set' "$result_path" >/dev/null; then
+                  echo "baseline の設定後 CPU 集合が元集合と一致しません: $launch_format/$mode" >&2
                   failures=1
                 fi
-              elif ! jq -e '.configured_cpu_set == .original_cpu_set' "$result_path" >/dev/null; then
-                echo "設定なし mode の設定後 CPU 集合が元集合と一致しません: $mode" >&2
-                failures=1
               fi
-            fi
+
+              if [[ "$RUNNER_OS" == Linux && "$mode" == affinity ]]; then
+                if ! jq -e '
+                  . as $result |
+                  (["thread_masks_after_core_initialization", "thread_masks_before_measurement", "thread_masks_after_measurement"]
+                    | all(.[]; . as $phase |
+                        ($result[$phase] | type == "object" and length > 0 and all(.[]; . == $result.requested_cpu_set)))
+                    ) and
+                  (.linux_thread_execution_cpu_samples | type == "array" and length > 0 and all(.[]; (.thread_cpu | type == "object" and length > 0))) and
+                  ([.linux_thread_execution_cpu_samples[]?.thread_cpu[]?]
+                    | all(. as $cpu | ($result.requested_cpu_set | index($cpu)) != null))
+                ' "$result_path" >/dev/null; then
+                  echo "Linux の全 TID mask または実行 CPU が checker の検証条件を満たしません: $launch_format/$mode" >&2
+                  failures=1
+                fi
+              fi
+
+              if [[ "$RUNNER_OS" == Windows && "$mode" == affinity ]]; then
+                if ! jq -e '
+                  . as $result |
+                  (["thread_masks_after_core_initialization", "thread_masks_before_measurement", "thread_masks_after_measurement"]
+                    | all(.[]; . as $phase |
+                        ($result[$phase] | type == "object" and (.process == $result.requested_cpu_set)))
+                    )
+                ' "$result_path" >/dev/null; then
+                  echo "Windows の全 process mask が checker の検証条件を満たしません: $launch_format/$mode" >&2
+                  failures=1
+                fi
+              fi
+            done
           done
           exit "$failures"
 
@@ -376,13 +601,21 @@ jobs:
             jq -r '(.logical_cpu_time_delta // {}) | to_entries | map("\(.key)=\(.value.busy_ratio)") | join(", ")' "$result_path" 2>/dev/null || echo "取得失敗"
           }
 
-          if [[ "$RUNNER_OS" == macOS ]]; then
-            capability_status=unsupported
-          elif [[ -f "$result_dir/affinity.json" ]] && jq -e '.status == "verified"' "$result_dir/affinity.json" >/dev/null 2>&1; then
-            capability_status=verified
-          else
-            capability_status=inconclusive
-          fi
+          format_excluded_busy_ratio() {
+            local result_path="$1"
+            if [[ ! -f "$result_path" ]]; then
+              echo "結果なし"
+              return
+            fi
+            jq -r '
+              .excluded_cpu as $cpu |
+              if $cpu == null then
+                "なし"
+              else
+                ((.logical_cpu_time_delta // {})[($cpu | tostring)].busy_ratio // "取得失敗")
+              end
+            ' "$result_path" 2>/dev/null || echo "取得失敗"
+          }
 
           {
             echo "## CPU affinity 実験"
@@ -390,28 +623,44 @@ jobs:
             echo "- OS: $RUNNER_OS"
             echo "- architecture: $RUNNER_ARCH"
             echo "- runner: ${RUNNER_NAME:-不明}"
-            echo "- capability status: $capability_status"
             echo "- Core: $VOICEVOX_CORE_AND_DOWNLOADER_VERSION"
             echo "- VOICEVOX ONNX Runtime: $VOICEVOX_ONNXRUNTIME_VERSION"
             echo "- VVM: $VOICEVOX_VVM_VERSION"
             echo
-            echo "| mode | status | 元 CPU 集合 | 要求 CPU 集合 | 設定後 CPU 集合 | 除外 CPU | cpu_num_threads | 推論回数 | 推論時間 秒 | 論理 CPU ごとの busy ratio |"
-            echo "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |"
-            for mode in default thread-count affinity; do
-              result_path="$result_dir/$mode.json"
-              status=$(format_value "$result_path" '.status // "結果なし"')
-              original_cpu_set=$(format_cpu_set "$result_path" original_cpu_set)
-              requested_cpu_set=$(format_cpu_set "$result_path" requested_cpu_set)
-              configured_cpu_set=$(format_cpu_set "$result_path" configured_cpu_set)
-              excluded_cpu=$(format_value "$result_path" '.excluded_cpu // "なし"')
-              cpu_num_threads=$(format_value "$result_path" '.cpu_num_threads // "なし"')
-              inference_count=$(format_value "$result_path" '.inference_count // "なし"')
-              inference_time=$(format_value "$result_path" '.inference_time_sec.total // "なし"')
-              busy_ratio=$(format_busy_ratio "$result_path")
-              echo "| $mode | $status | $original_cpu_set | $requested_cpu_set | $configured_cpu_set | $excluded_cpu | $cpu_num_threads | $inference_count | $inference_time | $busy_ratio |"
+            for launch_format in python pyinstaller; do
+              if [[ "$RUNNER_OS" == macOS ]]; then
+                capability_status=unsupported
+              elif jq -e '.status == "verified"' "$result_dir/$launch_format/affinity.json" >/dev/null 2>&1; then
+                capability_status=verified
+              else
+                capability_status=inconclusive
+              fi
+              echo "### $launch_format"
+              echo
+              echo "- capability status: $capability_status"
+              echo
+              echo "| mode | status | 元 CPU 集合 | 要求 CPU 集合 | 設定後 CPU 集合 | 除外 CPU | command threads | Engine threads | 推論回数 | 推論時間 秒 | 除外 CPU busy ratio | 論理 CPU ごとの busy ratio |"
+              echo "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"
+              for mode in default thread-count affinity; do
+                result_path="$result_dir/$launch_format/$mode.json"
+                status=$(format_value "$result_path" '.status // "結果なし"')
+                original_cpu_set=$(format_cpu_set "$result_path" original_cpu_set)
+                requested_cpu_set=$(format_cpu_set "$result_path" requested_cpu_set)
+                configured_cpu_set=$(format_cpu_set "$result_path" configured_cpu_set)
+                excluded_cpu=$(format_value "$result_path" '.excluded_cpu // "なし"')
+                command_cpu_num_threads=$(format_value "$result_path" '.command_cpu_num_threads // "なし"')
+                engine_cpu_num_threads=$(format_value "$result_path" '.engine_cpu_num_threads // "なし"')
+                inference_count=$(format_value "$result_path" '.inference_count // "なし"')
+                inference_time=$(format_value "$result_path" '.inference_time_sec.total // "なし"')
+                excluded_busy_ratio=$(format_excluded_busy_ratio "$result_path")
+                busy_ratio=$(format_busy_ratio "$result_path")
+                echo "| $mode | $status | $original_cpu_set | $requested_cpu_set | $configured_cpu_set | $excluded_cpu | $command_cpu_num_threads | $engine_cpu_num_threads | $inference_count | $inference_time | $excluded_busy_ratio | $busy_ratio |"
+              done
+              echo
             done
             echo
-            echo "システム全体の使用率は affinity の成功判定に使用せず、プロセスまたはスレッドの mask と実行 CPU の記録を判定に使用します。"
+            echo "PyInstaller mode は生成した dist/run/run または run.exe を直接起動しました。"
+            echo "observer の CPU 集合が Engine 起動前後で不変であることを検証し、システム全体の busy ratio は affinity 成功判定に使用していません。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: <Deploy> Upload CPU affinity results
@@ -420,7 +669,9 @@ jobs:
         with:
           name: cpu-affinity-${{ matrix.target }}-${{ github.run_id }}
           path: |
-            experiment-results/*.json
-            experiment-results/*.log
+            experiment-results/python/*.json
+            experiment-results/python/*.log
+            experiment-results/pyinstaller/*.json
+            experiment-results/pyinstaller/*.log
           if-no-files-found: error
           retention-days: 3
