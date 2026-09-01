@@ -1152,14 +1152,16 @@ def _verified_reason(mode: str) -> str:
 def _terminate_process(pid: int) -> None:
     try:
         process = psutil.Process(pid)
+        process.terminate()
     except psutil.NoSuchProcess:
         return
-    if process.is_running():
-        process.terminate()
     try:
         process.wait(timeout=10.0)
     except psutil.TimeoutExpired:
-        process.kill()
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            return
         process.wait(timeout=10.0)
 
 
