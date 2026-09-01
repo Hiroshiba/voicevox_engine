@@ -7,6 +7,7 @@ import ctypes
 import json
 import os
 import platform
+import re
 import socket
 import subprocess
 import sys
@@ -21,10 +22,15 @@ from urllib.request import Request, urlopen
 import psutil
 
 _MODES = ("default", "thread-count", "affinity")
+_LAUNCH_FORMATS = ("python", "pyinstaller")
+_VERIFICATION_FAILURE_EXIT_CODE = 1
 _UNSUPPORTED_EXIT_CODE = 70
 _INCONCLUSIVE_EXIT_CODE = 71
 _REQUEST_TIMEOUT_SEC = 120.0
 _TEXT = "こんにちは、音声合成の CPU affinity 検証です"
+_CPU_AFFINITY_LOG_MARKER = re.compile(
+    r'"event"\s*:\s*"cpu_affinity"|event=cpu_affinity'
+)
 
 
 def main() -> int:
@@ -45,15 +51,26 @@ def main() -> int:
     try:
         result = _run_trial(
             mode=args.mode,
+            launch_format=args.launch_format,
             duration_sec=args.duration_sec,
             warmup_count=args.warmup_count,
             startup_timeout_sec=args.startup_timeout_sec,
             log_path=log_path,
             engine_command=engine_command,
+            engine_cwd=_engine_cwd(args.launch_format, args.engine_cwd),
         )
+    except _VerificationError as error:
+        result = _failure_result(
+            base=_initial_result(args.mode, args.launch_format),
+            details=error.details,
+            status="failed",
+            reason=error.reason,
+        )
+        _write_result(output_path, result)
+        return _VERIFICATION_FAILURE_EXIT_CODE
     except _UnsupportedError as error:
         result = _failure_result(
-            base=_initial_result(args.mode),
+            base=_initial_result(args.mode, args.launch_format),
             details=error.details,
             status="unsupported",
             reason=error.reason,
@@ -62,7 +79,7 @@ def main() -> int:
         return _UNSUPPORTED_EXIT_CODE
     except _InconclusiveError as error:
         result = _failure_result(
-            base=_initial_result(args.mode),
+            base=_initial_result(args.mode, args.launch_format),
             details=error.details,
             status="inconclusive",
             reason=error.reason,
@@ -77,6 +94,13 @@ def main() -> int:
 
 
 class _UnsupportedError(Exception):
+    def __init__(self, reason: str, details: dict[str, object]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.details = details
+
+
+class _VerificationError(Exception):
     def __init__(self, reason: str, details: dict[str, object]) -> None:
         super().__init__(reason)
         self.reason = reason
@@ -141,17 +165,32 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup-timeout-sec", type=float, default=180.0)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--log-file", type=Path, required=True)
+    parser.add_argument("--engine-cwd", type=Path)
+    parser.add_argument("--launch-format", choices=_LAUNCH_FORMATS, default="python")
     parser.add_argument("engine_command", nargs=argparse.REMAINDER)
     return parser
 
 
+def _engine_cwd(launch_format: str, engine_cwd: Path | None) -> Path:
+    if launch_format not in _LAUNCH_FORMATS:
+        raise ValueError(f"想定外の launch-format です: {launch_format}")
+    if engine_cwd is not None:
+        return engine_cwd
+    repository_root = Path(__file__).resolve().parents[1]
+    if launch_format == "python":
+        return repository_root
+    return repository_root / "dist" / "run"
+
+
 def _run_trial(
     mode: str,
+    launch_format: str,
     duration_sec: float,
     warmup_count: int,
     startup_timeout_sec: float,
     log_path: Path,
     engine_command: list[str],
+    engine_cwd: Path,
 ) -> dict[str, object]:
     if mode not in _MODES:
         raise ValueError(f"想定外の mode です: {mode}")
@@ -161,9 +200,28 @@ def _run_trial(
         raise ValueError("warmup-count は0以上で指定してください。")
     if startup_timeout_sec <= 0:
         raise ValueError("startup-timeout-sec は正数で指定してください。")
-    result = _initial_result(mode)
+    if launch_format not in _LAUNCH_FORMATS:
+        raise ValueError(f"想定外の launch-format です: {launch_format}")
+    result = _initial_result(mode, launch_format)
+    result["engine_cwd"] = str(engine_cwd)
     system = platform.system()
-    original_cpu_set = _get_original_cpu_set()
+    observer_cpu_set, observer_thread_masks = _read_observer_state()
+    _store_observer_state(
+        result,
+        "before_launch",
+        observer_cpu_set,
+        observer_thread_masks,
+    )
+    original_cpu_set = observer_cpu_set
+    if original_cpu_set is None:
+        raise RuntimeError("検証開始時の observer CPU 集合を取得できません。")
+    _verify_observer_state(
+        result,
+        observer_cpu_set,
+        observer_thread_masks,
+        original_cpu_set,
+        "起動前",
+    )
     result["original_cpu_set"] = original_cpu_set
     if len(original_cpu_set) <= 1:
         raise _UnsupportedError(
@@ -174,46 +232,60 @@ def _run_trial(
     requested_cpu_set = [cpu for cpu in original_cpu_set if cpu != excluded_cpu]
     result["excluded_cpu"] = excluded_cpu
     result["requested_cpu_set"] = requested_cpu_set if mode != "default" else None
-    cpu_num_threads = len(requested_cpu_set) if mode != "default" else None
-    result["cpu_num_threads"] = cpu_num_threads
-
-    if mode == "affinity" and system == "Darwin":
-        raise _UnsupportedError(
-            "macOS では論理 CPU ID の affinity を設定できません。", result
-        )
+    command_cpu_num_threads = len(requested_cpu_set) if mode == "thread-count" else None
+    result["command_cpu_num_threads"] = command_cpu_num_threads
 
     port = _find_free_port()
     result["port"] = port
-    command = _build_engine_command(engine_command, port, cpu_num_threads)
+    command = _build_engine_command(engine_command, port, command_cpu_num_threads)
     child_env = os.environ.copy()
-    if mode == "default":
-        child_env.pop("VV_CPU_NUM_THREADS", None)
     child_env.pop("VV_USE_GPU", None)
+    child_env.pop("VV_CPU_NUM_THREADS", None)
+    if mode == "default" or mode == "thread-count":
+        child_env["VV_CPU_AFFINITY_MODE"] = "disabled"
+    else:
+        child_env.pop("VV_CPU_AFFINITY_MODE", None)
 
     process: subprocess.Popen[bytes] | None = None
     engine_pid: int | None = None
     sampler: _LinuxCpuSampler | None = None
     try:
         with open(log_path, "w", encoding="utf-8") as log_stream:
-            if mode == "affinity":
-                _set_current_cpu_set(requested_cpu_set)
-            try:
-                process = Popen(
-                    command,
-                    env=child_env,
-                    stdout=log_stream,
-                    stderr=subprocess.STDOUT,
-                )
-            finally:
-                if mode == "affinity":
-                    _set_current_cpu_set(original_cpu_set)
-
+            process = Popen(
+                command,
+                cwd=engine_cwd,
+                env=child_env,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                shell=False,
+            )
             result["launcher_pid"] = process.pid
+            _capture_observer_state(
+                result,
+                "after_popen",
+                original_cpu_set,
+            )
             result["engine_version"] = _wait_for_version(
                 process, port, startup_timeout_sec
             )
             engine_pid = _find_engine_process_id(process.pid, engine_command)
             result["engine_pid"] = engine_pid
+            result["cpu_affinity_event"] = _wait_for_cpu_affinity_event(
+                log_path,
+                process,
+                startup_timeout_sec,
+            )
+            engine_cpu_num_threads = _verify_cpu_affinity_event(
+                result,
+                result["cpu_affinity_event"],
+                mode,
+                system,
+                original_cpu_set,
+                requested_cpu_set,
+                command_cpu_num_threads,
+            )
+            result["engine_cpu_num_threads"] = engine_cpu_num_threads
+            result["cpu_num_threads"] = engine_cpu_num_threads
             thread_masks_after_core_initialization = _read_thread_masks(engine_pid)
             result["thread_masks_after_core_initialization"] = (
                 thread_masks_after_core_initialization
@@ -221,9 +293,11 @@ def _run_trial(
             result["configured_cpu_set"] = _configured_cpu_set(
                 engine_pid, thread_masks_after_core_initialization
             )
-
-            if mode == "affinity":
-                _verify_process_affinity(result, requested_cpu_set)
+            _capture_observer_state(
+                result,
+                "after_core_initialization",
+                original_cpu_set,
+            )
 
             query = _audio_query(port)
             for _ in range(warmup_count):
@@ -247,6 +321,11 @@ def _run_trial(
             linux_samples = _stop_linux_sampler(sampler)
             sampler = None
             result["thread_masks_after_measurement"] = _read_thread_masks(engine_pid)
+            _capture_observer_state(
+                result,
+                "after_measurement",
+                original_cpu_set,
+            )
             if system != "Darwin":
                 thread_cpu_after = _thread_cpu_times(engine_pid)
             process_cpu_after = _process_cpu_times(engine_pid)
@@ -275,6 +354,13 @@ def _run_trial(
             }
             if mode == "affinity" and system == "Linux":
                 _verify_linux_affinity(result, requested_cpu_set)
+            if mode == "affinity" and system == "Windows":
+                _verify_windows_affinity(result, requested_cpu_set)
+            if mode == "affinity" and system == "Darwin":
+                raise _UnsupportedError(
+                    "macOS の CPU affinity は診断上 unsupported です。合成は成功しました。",
+                    result,
+                )
             result["status"] = "verified"
             result["verified"] = True
             result["unsupported"] = False
@@ -288,10 +374,19 @@ def _run_trial(
         if process is not None:
             _terminate_process(process.pid)
             process.wait()
+            _capture_observer_state(
+                result,
+                "after_engine_exit",
+                original_cpu_set,
+            )
     return result
 
 
-def _initial_result(mode: str) -> dict[str, object]:
+def _initial_result(mode: str, launch_format: str) -> dict[str, object]:
+    if mode not in _MODES:
+        raise ValueError(f"想定外の mode です: {mode}")
+    if launch_format not in _LAUNCH_FORMATS:
+        raise ValueError(f"想定外の launch-format です: {launch_format}")
     return {
         "environment": {
             "os": platform.system(),
@@ -302,6 +397,8 @@ def _initial_result(mode: str) -> dict[str, object]:
             "github_actions": _github_actions_environment(),
         },
         "mode": mode,
+        "launch_format": launch_format,
+        "engine_cwd": None,
         "engine_version": None,
         "status": "inconclusive",
         "verified": False,
@@ -311,6 +408,8 @@ def _initial_result(mode: str) -> dict[str, object]:
         "requested_cpu_set": None,
         "configured_cpu_set": None,
         "excluded_cpu": None,
+        "command_cpu_num_threads": None,
+        "engine_cpu_num_threads": None,
         "cpu_num_threads": None,
         "thread_masks_after_core_initialization": {},
         "thread_masks_before_measurement": {},
@@ -323,6 +422,9 @@ def _initial_result(mode: str) -> dict[str, object]:
         "linux_thread_execution_cpu_samples": [],
         "inference_count": 0,
         "inference_time_sec": {},
+        "cpu_affinity_event": None,
+        "observer_cpu_sets": {},
+        "observer_thread_masks": {},
     }
 
 
@@ -357,33 +459,74 @@ def _write_result(output_path: Path, result: dict[str, object]) -> None:
     )
 
 
-def _get_original_cpu_set() -> list[int]:
+def _read_observer_state() -> tuple[list[int] | None, dict[str, list[int]] | None]:
     system = platform.system()
     if system == "Linux":
-        return sorted(os.sched_getaffinity(0))
+        return sorted(os.sched_getaffinity(0)), _linux_thread_masks(os.getpid())
     if system == "Windows":
-        return _windows_process_cpu_set(os.getpid())
+        return _windows_process_cpu_set(os.getpid()), None
     if system == "Darwin":
         cpu_count = os.cpu_count()
         if cpu_count is None:
             raise RuntimeError("macOS の論理 CPU 数を取得できませんでした。")
-        return list(range(cpu_count))
+        return list(range(cpu_count)), None
     raise RuntimeError(f"対応していない OS です: {system}")
 
 
-def _set_current_cpu_set(cpu_set: list[int]) -> None:
-    if not cpu_set:
-        raise ValueError("affinity に空の CPU 集合は指定できません。")
-    system = platform.system()
-    if system == "Linux":
-        os.sched_setaffinity(0, set(cpu_set))
-        return
-    if system == "Windows":
-        _windows_set_current_process_cpu_set(cpu_set)
-        return
-    raise _UnsupportedError(
-        f"{system} では論理 CPU ID の affinity を設定できません。", {}
+def _store_observer_state(
+    result: dict[str, object],
+    phase: str,
+    cpu_set: list[int] | None,
+    thread_masks: dict[str, list[int]] | None,
+) -> None:
+    cpu_sets = result["observer_cpu_sets"]
+    if not isinstance(cpu_sets, dict):
+        raise RuntimeError("observer CPU 集合の保存先が不正です。")
+    cpu_sets[phase] = cpu_set
+    observer_thread_masks = result["observer_thread_masks"]
+    if not isinstance(observer_thread_masks, dict):
+        raise RuntimeError("observer thread mask の保存先が不正です。")
+    observer_thread_masks[phase] = thread_masks
+
+
+def _capture_observer_state(
+    result: dict[str, object], phase: str, expected_cpu_set: list[int]
+) -> None:
+    cpu_set, thread_masks = _read_observer_state()
+    _store_observer_state(result, phase, cpu_set, thread_masks)
+    _verify_observer_state(
+        result,
+        cpu_set,
+        thread_masks,
+        expected_cpu_set,
+        phase,
     )
+
+
+def _verify_observer_state(
+    result: dict[str, object],
+    cpu_set: list[int] | None,
+    thread_masks: dict[str, list[int]] | None,
+    expected_cpu_set: list[int],
+    phase: str,
+) -> None:
+    if cpu_set != expected_cpu_set:
+        raise _VerificationError(
+            f"observer の CPU 集合が{phase}に起動前と一致しません。",
+            result,
+        )
+    if platform.system() != "Linux":
+        return
+    if thread_masks is None or len(thread_masks) == 0:
+        raise _VerificationError(
+            f"observer の全 TID mask を{phase}に取得できません。", result
+        )
+    for mask in thread_masks.values():
+        if mask != expected_cpu_set:
+            raise _VerificationError(
+                f"observer の TID mask が{phase}に起動前と一致しません。",
+                result,
+            )
 
 
 def _build_engine_command(
@@ -452,6 +595,162 @@ def _wait_for_version(
             "Engine の起動を待機中にタイムアウトしました。"
         ) from last_error
     raise RuntimeError("Engine の起動を待機中にタイムアウトしました。")
+
+
+def _wait_for_cpu_affinity_event(
+    log_path: Path,
+    process: subprocess.Popen[bytes],
+    timeout_sec: float,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        events = _read_cpu_affinity_events(log_path)
+        if len(events) != 0:
+            return events[-1]
+        if process.poll() is not None:
+            raise RuntimeError(
+                "Engine のログに cpu_affinity 診断イベントがありません。"
+            )
+        time.sleep(0.1)
+    raise RuntimeError(
+        "Engine の cpu_affinity 診断イベントを待機中にタイムアウトしました。"
+    )
+
+
+def _read_cpu_affinity_events(log_path: Path) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if _CPU_AFFINITY_LOG_MARKER.search(line) is None:
+            continue
+        json_start = line.find("{")
+        if json_start < 0:
+            raise RuntimeError(
+                "cpu_affinity 診断 marker を含むログ行に JSON がありません。"
+            )
+        payload = json.loads(line[json_start:])
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                "cpu_affinity 診断イベントが JSON オブジェクトではありません。"
+            )
+        if payload.get("event") != "cpu_affinity":
+            raise RuntimeError("cpu_affinity 診断イベントの marker が不正です。")
+        events.append(payload)
+    return events
+
+
+def _verify_cpu_affinity_event(
+    result: dict[str, object],
+    event: object,
+    mode: str,
+    system: str,
+    original_cpu_set: list[int],
+    requested_cpu_set: list[int],
+    command_cpu_num_threads: int | None,
+) -> int | None:
+    if not isinstance(event, dict):
+        raise _VerificationError(
+            "Engine の cpu_affinity 診断イベントが JSON オブジェクトではありません。",
+            result,
+        )
+    if event.get("event") != "cpu_affinity":
+        raise _VerificationError(
+            "Engine の cpu_affinity 診断イベントの event が不正です。", result
+        )
+    if mode == "default" or mode == "thread-count":
+        expected_mode = "disabled"
+        expected_state = "disabled"
+        expected_original_cpu_set: list[int] | None = None
+        expected_requested_cpu_set: list[int] | None = None
+        expected_configured_cpu_set: list[int] | None = None
+        expected_excluded_cpu: int | None = None
+        expected_cpu_num_threads = command_cpu_num_threads
+    elif mode == "affinity":
+        expected_mode = "auto"
+        if system == "Darwin":
+            expected_state = "unsupported"
+            expected_original_cpu_set = None
+            expected_requested_cpu_set = None
+            expected_configured_cpu_set = None
+            expected_excluded_cpu = None
+            expected_cpu_num_threads = None
+        else:
+            expected_state = "applied"
+            expected_original_cpu_set = original_cpu_set
+            expected_requested_cpu_set = requested_cpu_set
+            expected_configured_cpu_set = requested_cpu_set
+            expected_excluded_cpu = max(original_cpu_set)
+            expected_cpu_num_threads = len(requested_cpu_set)
+    else:
+        raise ValueError(f"想定外の mode です: {mode}")
+
+    expected_values: dict[str, object] = {
+        "mode": expected_mode,
+        "state": expected_state,
+        "original_cpu_set": expected_original_cpu_set,
+        "requested_cpu_set": expected_requested_cpu_set,
+        "configured_cpu_set": expected_configured_cpu_set,
+        "excluded_cpu": expected_excluded_cpu,
+        "cpu_num_threads": expected_cpu_num_threads,
+    }
+    for field, expected in expected_values.items():
+        if field not in event:
+            raise _VerificationError(
+                f"Engine の cpu_affinity 診断イベントに {field} がありません。", result
+            )
+        actual = event[field]
+        if field.endswith("cpu_set"):
+            actual = _validated_cpu_set(actual, field, result)
+        elif field == "excluded_cpu":
+            if actual is not None and (
+                not isinstance(actual, int) or isinstance(actual, bool)
+            ):
+                raise _VerificationError(
+                    f"Engine の cpu_affinity 診断イベントの {field} が不正です。",
+                    result,
+                )
+        elif field == "cpu_num_threads":
+            actual = _validated_cpu_num_threads(actual, result)
+        if actual != expected:
+            raise _VerificationError(
+                f"Engine の cpu_affinity 診断イベントの {field} が想定値と一致しません。",
+                result,
+            )
+    reason = event.get("reason")
+    if not isinstance(reason, str) or len(reason) == 0:
+        raise _VerificationError(
+            "Engine の cpu_affinity 診断イベントの reason が不正です。", result
+        )
+    return _validated_cpu_num_threads(event["cpu_num_threads"], result)
+
+
+def _validated_cpu_set(
+    value: object, field: str, result: dict[str, object]
+) -> list[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or any(
+        not isinstance(cpu, int) or isinstance(cpu, bool) or cpu < 0 for cpu in value
+    ):
+        raise _VerificationError(
+            f"Engine の cpu_affinity 診断イベントの {field} が不正です。", result
+        )
+    if value != sorted(set(value)):
+        raise _VerificationError(
+            f"Engine の cpu_affinity 診断イベントの {field} が整列されていません。",
+            result,
+        )
+    return value
+
+
+def _validated_cpu_num_threads(value: object, result: dict[str, object]) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise _VerificationError(
+            "Engine の cpu_affinity 診断イベントの cpu_num_threads が不正です。",
+            result,
+        )
+    return value
 
 
 def _http_request(url: str, method: str, body: bytes | None) -> bytes:
@@ -544,7 +843,10 @@ def _configured_cpu_set(
             )
         return main_mask
     if platform.system() == "Windows":
-        return _windows_process_cpu_set(pid)
+        process_mask = thread_masks.get("process")
+        if not isinstance(process_mask, list):
+            raise RuntimeError("Engine の process affinity を取得できません。")
+        return process_mask
     return None
 
 
@@ -723,20 +1025,6 @@ def _stop_linux_sampler(sampler: _LinuxCpuSampler | None) -> list[dict[str, obje
     return sampler.stop()
 
 
-def _verify_process_affinity(
-    result: dict[str, object], requested_cpu_set: list[int]
-) -> None:
-    configured_cpu_set = result["configured_cpu_set"]
-    if not isinstance(configured_cpu_set, list):
-        raise _InconclusiveError(
-            "子 Engine の process affinity を読み取れませんでした。", result
-        )
-    if configured_cpu_set != requested_cpu_set:
-        raise _InconclusiveError(
-            "子 Engine の process affinity が要求集合と一致しません。", result
-        )
-
-
 def _verify_linux_affinity(
     result: dict[str, object], requested_cpu_set: list[int]
 ) -> None:
@@ -748,7 +1036,7 @@ def _verify_linux_affinity(
     )
     for mask_field in mask_fields:
         masks = result[mask_field]
-        if not isinstance(masks, dict) or not masks:
+        if not isinstance(masks, dict) or len(masks) == 0:
             raise _InconclusiveError(
                 f"Linux の {mask_field} を取得できませんでした。", result
             )
@@ -758,11 +1046,11 @@ def _verify_linux_affinity(
                     f"Linux の {mask_field} の形式が不正です。", result
                 )
             if set(mask) != requested_cpus:
-                raise _InconclusiveError(
+                raise _VerificationError(
                     f"Linux の {mask_field} が要求集合と一致しません。", result
                 )
     samples = result["linux_thread_execution_cpu_samples"]
-    if not isinstance(samples, list) or not samples:
+    if not isinstance(samples, list) or len(samples) == 0:
         raise _InconclusiveError(
             "Linux の thread 実行 CPU サンプルがありません。", result
         )
@@ -777,20 +1065,58 @@ def _verify_linux_affinity(
                 "Linux の thread 実行 CPU サンプルの形式が不正です。", result
             )
         for cpu in thread_cpu.values():
-            if not isinstance(cpu, int) or cpu not in requested_cpus:
-                raise _InconclusiveError(
+            if (
+                not isinstance(cpu, int)
+                or isinstance(cpu, bool)
+                or cpu not in requested_cpus
+            ):
+                raise _VerificationError(
                     "Linux の thread 実行 CPU サンプルに要求外 CPU が現れました。",
                     result,
                 )
 
 
+def _verify_windows_affinity(
+    result: dict[str, object], requested_cpu_set: list[int]
+) -> None:
+    configured_cpu_set = result["configured_cpu_set"]
+    if not isinstance(configured_cpu_set, list):
+        raise _InconclusiveError(
+            "子 Engine の process affinity を読み取れませんでした。", result
+        )
+    if configured_cpu_set != requested_cpu_set:
+        raise _VerificationError(
+            "子 Engine の process affinity が要求集合と一致しません。", result
+        )
+    mask_fields = (
+        "thread_masks_after_core_initialization",
+        "thread_masks_before_measurement",
+        "thread_masks_after_measurement",
+    )
+    for mask_field in mask_fields:
+        masks = result[mask_field]
+        if not isinstance(masks, dict):
+            raise _InconclusiveError(
+                f"Windows の {mask_field} を取得できませんでした。", result
+            )
+        process_mask = masks.get("process")
+        if not isinstance(process_mask, list):
+            raise _InconclusiveError(
+                f"Windows の {mask_field} の形式が不正です。", result
+            )
+        if process_mask != requested_cpu_set:
+            raise _VerificationError(
+                f"Windows の {mask_field} が要求集合と一致しません。", result
+            )
+
+
 def _verified_reason(mode: str) -> str:
     if mode == "default":
-        return "affinity と cpu_num_threads を指定せず合成と計測が完了しました。"
+        return "VV_CPU_AFFINITY_MODE=disabled を渡して CPU affinity を比較用に無効化し、cpu_num_threads を指定せず合成と計測が完了しました。"
     if mode == "thread-count":
-        return "正数 cpu_num_threads を指定して合成と計測が完了しました。"
+        return "VV_CPU_AFFINITY_MODE=disabled を渡して CPU affinity を比較用に無効化し、正数 cpu_num_threads を指定して合成と計測が完了しました。"
     if mode == "affinity":
-        return "除外 CPU が thread mask と実行 CPU サンプルに現れませんでした。"
+        return "Engine 自身が設定した CPU affinity が要求集合と一致し、除外 CPU が thread mask と実行 CPU サンプルに現れませんでした。"
     raise ValueError(f"想定外の mode です: {mode}")
 
 
@@ -810,8 +1136,11 @@ def _terminate_process(pid: int) -> None:
 
 def _windows_kernel32() -> ctypes.CDLL:
     kernel32 = ctypes.CDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
     kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetActiveProcessorGroupCount.argtypes = []
     kernel32.GetActiveProcessorGroupCount.restype = ctypes.c_ushort
+    kernel32.GetLastError.argtypes = []
     kernel32.GetLastError.restype = ctypes.c_uint32
     kernel32.GetProcessAffinityMask.argtypes = [
         ctypes.c_void_p,
@@ -819,8 +1148,6 @@ def _windows_kernel32() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_size_t),
     ]
     kernel32.GetProcessAffinityMask.restype = ctypes.c_int
-    kernel32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    kernel32.SetProcessAffinityMask.restype = ctypes.c_int
     kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
@@ -835,10 +1162,13 @@ def _windows_error(kernel32: ctypes.CDLL) -> OSError:
 
 def _windows_process_cpu_set(pid: int) -> list[int]:
     kernel32 = _windows_kernel32()
-    if kernel32.GetActiveProcessorGroupCount() > 1:
+    processor_group_count = int(kernel32.GetActiveProcessorGroupCount())
+    if processor_group_count > 1:
         raise _UnsupportedError(
             "複数の processor group を持つ Windows 環境は未対応です。", {}
         )
+    if processor_group_count != 1:
+        raise RuntimeError("Windows の processor group 数を取得できません。")
     current_pid = os.getpid()
     if pid == current_pid:
         handle = kernel32.GetCurrentProcess()
@@ -863,19 +1193,6 @@ def _windows_process_cpu_set(pid: int) -> list[int]:
     finally:
         if should_close and not kernel32.CloseHandle(handle):
             raise _windows_error(kernel32)
-
-
-def _windows_set_current_process_cpu_set(cpu_set: list[int]) -> None:
-    kernel32 = _windows_kernel32()
-    mask = 0
-    for cpu in cpu_set:
-        if cpu < 0 or cpu >= ctypes.sizeof(ctypes.c_size_t) * 8:
-            raise ValueError(f"CPU ID が process affinity mask の範囲外です: {cpu}")
-        mask |= 1 << cpu
-    if not kernel32.SetProcessAffinityMask(
-        kernel32.GetCurrentProcess(), ctypes.c_size_t(mask)
-    ):
-        raise _windows_error(kernel32)
 
 
 if __name__ == "__main__":
