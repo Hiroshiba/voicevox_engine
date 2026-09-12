@@ -1,9 +1,11 @@
 """`cpu_execution.py` のテスト"""
 
 import pickle
+from unittest.mock import patch
 
 import pytest
 
+from voicevox_engine.core import cpu_execution
 from voicevox_engine.core.cpu_execution import (
     HybridCpuTopology,
     LegacyCpuExecutionPlan,
@@ -247,3 +249,120 @@ def test_cpu_execution_plan_is_pickleable(
 ) -> None:
     """CPU実行計画がpickle化できる。"""
     assert pickle.loads(pickle.dumps(plan)) == plan
+
+
+def test_create_cpu_execution_plan_dispatches_windows_hybrid() -> None:
+    """共通の計画生成がWindowsのhybrid検出と計画生成へ振り分ける。"""
+    topology = _create_topology(((0,), (1,)), (((2,),),))
+    expected = WindowsCpuExecutionPlan(1, (0,))
+    with patch.object(cpu_execution.platform, "system", return_value="Windows"):
+        with patch(
+            "voicevox_engine.core.cpu_execution_windows.detect_windows_hybrid_cpu_topology",
+            return_value=topology,
+        ):
+            with patch.object(
+                cpu_execution,
+                "create_windows_cpu_execution_plan",
+                return_value=expected,
+            ) as create_plan:
+                plan = cpu_execution.create_cpu_execution_plan(1)
+
+    assert plan == expected
+    create_plan.assert_called_once_with(1, topology)
+
+
+def test_create_cpu_execution_plan_dispatches_linux_hybrid() -> None:
+    """共通の計画生成がLinuxのhybrid検出と計画生成へ振り分ける。"""
+    topology = _create_topology(((0,), (1,)), (((2,),),))
+    expected = LinuxCpuExecutionPlan(1, (0,))
+    with patch.object(cpu_execution.platform, "system", return_value="Linux"):
+        with patch(
+            "voicevox_engine.core.cpu_execution_linux.detect_linux_hybrid_cpu_topology",
+            return_value=topology,
+        ):
+            with patch.object(
+                cpu_execution,
+                "create_linux_cpu_execution_plan",
+                return_value=expected,
+            ) as create_plan:
+                plan = cpu_execution.create_cpu_execution_plan(1)
+
+    assert plan == expected
+    create_plan.assert_called_once_with(1, topology)
+
+
+def test_create_cpu_execution_plan_uses_legacy_for_non_hybrid_without_psutil() -> None:
+    """明示値のnon-hybrid計画はpsutilを読まずlegacy計画を返す。"""
+    with patch.object(cpu_execution.platform, "system", return_value="Linux"):
+        with patch(
+            "voicevox_engine.core.cpu_execution_linux.detect_linux_hybrid_cpu_topology",
+            return_value=None,
+        ):
+            with patch.object(
+                cpu_execution.psutil,
+                "cpu_count",
+                side_effect=AssertionError("psutilは呼び出されません"),
+            ):
+                plan = cpu_execution.create_cpu_execution_plan(3)
+
+    assert plan == LegacyCpuExecutionPlan(3)
+
+
+def test_create_cpu_execution_plan_uses_legacy_for_darwin() -> None:
+    """Darwinの計画生成はlegacyへ振り分ける。"""
+    with patch.object(cpu_execution.platform, "system", return_value="Darwin"):
+        with patch.object(
+            cpu_execution.psutil,
+            "cpu_count",
+            side_effect=[8, 8],
+        ):
+            plan = cpu_execution.create_cpu_execution_plan(None)
+
+    assert plan == LegacyCpuExecutionPlan(4)
+
+
+def test_create_cpu_execution_plan_validates_before_os_detection() -> None:
+    """不正なCPUスレッド数はOS検出前に拒否する。"""
+    with patch.object(
+        cpu_execution.platform,
+        "system",
+        side_effect=AssertionError("OS検出は開始されません"),
+    ):
+        with pytest.raises(ValueError, match="cpu_num_threads"):
+            cpu_execution.create_cpu_execution_plan(True)
+
+
+def test_create_cpu_execution_plan_rejects_unknown_os() -> None:
+    """未知のOSを共通計画生成で拒否する。"""
+    with patch.object(cpu_execution.platform, "system", return_value="Plan9"):
+        with pytest.raises(RuntimeError, match="対応していないOS"):
+            cpu_execution.create_cpu_execution_plan(None)
+
+
+def test_apply_and_validate_cpu_execution_plan_dispatch() -> None:
+    """共通の適用と検証がWindows、Linux、legacyへ振り分ける。"""
+    windows_plan = WindowsCpuExecutionPlan(1, (0,))
+    linux_plan = LinuxCpuExecutionPlan(1, (0,))
+    with patch(
+        "voicevox_engine.core.cpu_execution_windows.apply_windows_cpu_execution_plan"
+    ) as apply_windows:
+        with patch(
+            "voicevox_engine.core.cpu_execution_windows.validate_windows_cpu_execution_plan"
+        ) as validate_windows:
+            cpu_execution.apply_cpu_execution_plan(windows_plan)
+            cpu_execution.validate_cpu_execution_plan(windows_plan)
+    with patch(
+        "voicevox_engine.core.cpu_execution_linux.apply_linux_cpu_execution_plan"
+    ) as apply_linux:
+        with patch(
+            "voicevox_engine.core.cpu_execution_linux.validate_linux_cpu_execution_plan"
+        ) as validate_linux:
+            cpu_execution.apply_cpu_execution_plan(linux_plan)
+            cpu_execution.validate_cpu_execution_plan(linux_plan)
+
+    cpu_execution.apply_cpu_execution_plan(LegacyCpuExecutionPlan(0))
+    cpu_execution.validate_cpu_execution_plan(LegacyCpuExecutionPlan(0))
+    apply_windows.assert_called_once_with(windows_plan)
+    validate_windows.assert_called_once_with(windows_plan)
+    apply_linux.assert_called_once_with(linux_plan)
+    validate_linux.assert_called_once_with(linux_plan)

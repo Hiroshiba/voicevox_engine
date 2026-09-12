@@ -1,6 +1,11 @@
 """CPU実行計画の値と選択処理"""
 
+import platform
 from dataclasses import dataclass
+
+import psutil
+
+from voicevox_engine.utility.error_utility import UnreachableError
 
 type PhysicalCore = tuple[int, ...]
 type ECoreTier = tuple[PhysicalCore, ...]
@@ -231,3 +236,90 @@ def create_linux_cpu_execution_plan(
         cpu_num_threads, topology
     )
     return LinuxCpuExecutionPlan(resolved_cpu_num_threads, logical_cpu_ids)
+
+
+def _create_legacy_cpu_execution_plan_from_system(
+    cpu_num_threads: int | None,
+) -> LegacyCpuExecutionPlan:
+    if cpu_num_threads is not None:
+        return LegacyCpuExecutionPlan(cpu_num_threads)
+    return create_legacy_cpu_execution_plan(
+        cpu_num_threads,
+        psutil.cpu_count(logical=True),
+        psutil.cpu_count(logical=False),
+    )
+
+
+def create_cpu_execution_plan(
+    cpu_num_threads: int | None,
+) -> CpuExecutionPlan:
+    """実行環境に応じたCPU実行計画を生成する。"""
+    validated_cpu_num_threads = _validate_cpu_num_threads(cpu_num_threads)
+    system = platform.system()
+    if system == "Windows":
+        from voicevox_engine.core.cpu_execution_windows import (
+            detect_windows_hybrid_cpu_topology,
+        )
+
+        topology = detect_windows_hybrid_cpu_topology()
+        if topology is None:
+            return _create_legacy_cpu_execution_plan_from_system(
+                validated_cpu_num_threads
+            )
+        return create_windows_cpu_execution_plan(validated_cpu_num_threads, topology)
+    if system == "Linux":
+        from voicevox_engine.core.cpu_execution_linux import (
+            detect_linux_hybrid_cpu_topology,
+        )
+
+        topology = detect_linux_hybrid_cpu_topology()
+        if topology is None:
+            return _create_legacy_cpu_execution_plan_from_system(
+                validated_cpu_num_threads
+            )
+        return create_linux_cpu_execution_plan(validated_cpu_num_threads, topology)
+    if system == "Darwin":
+        return _create_legacy_cpu_execution_plan_from_system(validated_cpu_num_threads)
+    raise RuntimeError(f"対応していないOSです: {system}")
+
+
+def apply_cpu_execution_plan(plan: CpuExecutionPlan) -> None:
+    """CPU実行計画を現在のプロセスへ適用する。"""
+    if isinstance(plan, LegacyCpuExecutionPlan):
+        return
+    if isinstance(plan, WindowsCpuExecutionPlan):
+        from voicevox_engine.core.cpu_execution_windows import (
+            apply_windows_cpu_execution_plan,
+        )
+
+        apply_windows_cpu_execution_plan(plan)
+        return
+    if isinstance(plan, LinuxCpuExecutionPlan):
+        from voicevox_engine.core.cpu_execution_linux import (
+            apply_linux_cpu_execution_plan,
+        )
+
+        apply_linux_cpu_execution_plan(plan)
+        return
+    raise UnreachableError("CPU実行計画の型が不正です。")
+
+
+def validate_cpu_execution_plan(plan: CpuExecutionPlan) -> None:
+    """CPU実行計画が現在のCPU affinityへ反映されていることを検証する。"""
+    if isinstance(plan, LegacyCpuExecutionPlan):
+        return
+    if isinstance(plan, WindowsCpuExecutionPlan):
+        from voicevox_engine.core.cpu_execution_windows import (
+            validate_windows_cpu_execution_plan,
+        )
+
+        validate_windows_cpu_execution_plan(plan)
+        return
+    if isinstance(plan, LinuxCpuExecutionPlan):
+        from voicevox_engine.core.cpu_execution_linux import (
+            validate_linux_cpu_execution_plan,
+        )
+
+        validate_linux_cpu_execution_plan(plan)
+        return
+    raise UnreachableError("CPU実行計画の型が不正です。")
