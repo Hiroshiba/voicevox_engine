@@ -1,6 +1,7 @@
 """`cpu_execution_linux.py` のテスト"""
 
 import errno
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,13 +87,19 @@ def _write_topology(
         )
 
 
-def _patch_topology_paths(root: Path) -> dict[str, Path]:
-    return {
-        "_CPU_CORE_CPUS_PATH": root / "cpu_core" / "cpus",
-        "_CPU_ATOM_CPUS_PATH": root / "cpu_atom" / "cpus",
-        "_ONLINE_CPUS_PATH": root / "system_cpu" / "online",
-        "_CPU_SYSFS_PATH": root / "cpu",
-    }
+def _patch_topology_paths(root: Path) -> ExitStack:
+    patches = ExitStack()
+    patches.enter_context(
+        patch.object(linux, "_CPU_CORE_CPUS_PATH", root / "cpu_core" / "cpus")
+    )
+    patches.enter_context(
+        patch.object(linux, "_CPU_ATOM_CPUS_PATH", root / "cpu_atom" / "cpus")
+    )
+    patches.enter_context(
+        patch.object(linux, "_ONLINE_CPUS_PATH", root / "system_cpu" / "online")
+    )
+    patches.enter_context(patch.object(linux, "_CPU_SYSFS_PATH", root / "cpu"))
+    return patches
 
 
 def test_detect_linux_topology_intersects_online_and_all_thread_masks(
@@ -112,7 +119,7 @@ def test_detect_linux_topology_intersects_online_and_all_thread_masks(
     )
     path_patches = _patch_topology_paths(tmp_path)
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             with patch.object(linux, "_list_thread_ids", side_effect=threads.list_ids):
                 with patch.object(
                     linux,
@@ -140,7 +147,7 @@ def test_detect_retries_when_topology_changes_during_detection(
     threads = _FakeThreads((100,), {100: {0, 1, 2, 3}})
     path_patches = _patch_topology_paths(tmp_path)
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             with patch.object(linux, "_list_thread_ids", side_effect=threads.list_ids):
                 with patch.object(
                     linux, "_get_thread_affinity", side_effect=threads.get
@@ -162,7 +169,7 @@ def test_detect_returns_none_on_non_x86_without_reading_hybrid_sysfs(
     """Linuxの非x86環境をlegacy扱いにする。"""
     path_patches = _patch_topology_paths(tmp_path)
     with patch.object(linux, "_is_x86", return_value=False):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             assert linux.detect_linux_hybrid_cpu_topology() is None
 
 
@@ -172,7 +179,7 @@ def test_detect_returns_none_when_both_hybrid_sysfs_files_are_missing(
     """Linuxの両方のhybrid sysfsがない場合はlegacy扱いにする。"""
     path_patches = _patch_topology_paths(tmp_path)
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             assert linux.detect_linux_hybrid_cpu_topology() is None
 
 
@@ -182,7 +189,7 @@ def test_detect_rejects_only_one_hybrid_sysfs_file(tmp_path: Path) -> None:
     (tmp_path / "cpu_core" / "cpus").write_text("0", encoding="ascii")
     path_patches = _patch_topology_paths(tmp_path)
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             with pytest.raises(ValueError, match="片方"):
                 linux.detect_linux_hybrid_cpu_topology()
 
@@ -196,7 +203,7 @@ def test_detect_rejects_invalid_hybrid_sysfs_cpu_list(
     _write_topology(tmp_path, p_cpus, "2", "0-2", {2: "2"})
     path_patches = _patch_topology_paths(tmp_path)
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             with pytest.raises(ValueError, match="CPUリスト|空|範囲|重複"):
                 linux.detect_linux_hybrid_cpu_topology()
 
@@ -207,7 +214,7 @@ def test_detect_rejects_unknown_available_cpu(tmp_path: Path) -> None:
     path_patches = _patch_topology_paths(tmp_path)
     threads = _FakeThreads((100,), {100: {0, 1, 2}})
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             with patch.object(linux, "_list_thread_ids", side_effect=threads.list_ids):
                 with patch.object(
                     linux, "_get_thread_affinity", side_effect=threads.get
@@ -222,7 +229,7 @@ def test_detect_returns_none_when_one_class_is_not_allowed(tmp_path: Path) -> No
     path_patches = _patch_topology_paths(tmp_path)
     threads = _FakeThreads((100,), {100: {0, 1}})
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             with patch.object(linux, "_list_thread_ids", side_effect=threads.list_ids):
                 with patch.object(
                     linux, "_get_thread_affinity", side_effect=threads.get
@@ -238,7 +245,7 @@ def test_detect_keeps_only_allowed_smt_siblings(tmp_path: Path) -> None:
     path_patches = _patch_topology_paths(tmp_path)
     threads = _FakeThreads((100,), {100: {0, 2}})
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             with patch.object(linux, "_list_thread_ids", side_effect=threads.list_ids):
                 with patch.object(
                     linux, "_get_thread_affinity", side_effect=threads.get
@@ -256,7 +263,7 @@ def test_detect_rejects_inconsistent_or_cross_class_siblings(tmp_path: Path) -> 
     path_patches = _patch_topology_paths(tmp_path)
     threads = _FakeThreads((100,), {100: {0, 1}})
     with patch.object(linux, "_is_x86", return_value=True):
-        with patch.multiple(linux, **path_patches):
+        with path_patches:
             with patch.object(linux, "_list_thread_ids", side_effect=threads.list_ids):
                 with patch.object(
                     linux, "_get_thread_affinity", side_effect=threads.get

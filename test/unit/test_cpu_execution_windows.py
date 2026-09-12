@@ -1,5 +1,7 @@
 """`cpu_execution_windows.py` のテスト"""
 
+from __future__ import annotations
+
 import ctypes
 from unittest.mock import patch
 
@@ -346,20 +348,23 @@ def test_import_is_possible_without_windll() -> None:
 def test_get_system_cpu_set_information_retries_second_insufficient_buffer() -> None:
     """二段階取得の二回目だけ容量不足なら再取得する。"""
     api = object.__new__(windows._WindowsApi)
-    api._current_process = lambda: windows._HANDLE(1)
     calls: list[bool] = []
 
     def get_information(
         information: object,
         buffer_size: int,
-        returned_length: object,
+        returned_length: ctypes._CArgObject,
         process: object,
         flags: int,
     ) -> int:
         del buffer_size, process, flags
         is_query = information is None
         calls.append(is_query)
-        returned_length._obj.value = 32
+        returned_length_pointer = ctypes.cast(
+            returned_length,
+            ctypes.POINTER(windows._DWORD),
+        )
+        returned_length_pointer.contents.value = 32
         if is_query:
             return 0
         if calls.count(False) == 1:
@@ -369,8 +374,13 @@ def test_get_system_cpu_set_information_retries_second_insufficient_buffer() -> 
     api._get_system_cpu_set_information = get_information
     with patch.object(
         windows._WindowsApi,
-        "_last_error_code",
-        side_effect=[122, 122, 122],
+        "_current_process",
+        return_value=windows._HANDLE(1),
     ):
-        assert api.get_system_cpu_set_information() == bytes(32)
+        with patch.object(
+            windows._WindowsApi,
+            "_last_error_code",
+            side_effect=[122, 122, 122],
+        ):
+            assert api.get_system_cpu_set_information() == bytes(32)
     assert calls == [True, False, True, False]

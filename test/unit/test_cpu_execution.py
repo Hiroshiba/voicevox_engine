@@ -255,7 +255,10 @@ def test_create_cpu_execution_plan_dispatches_windows_hybrid() -> None:
     """共通の計画生成がWindowsのhybrid検出と計画生成へ振り分ける。"""
     topology = _create_topology(((0,), (1,)), (((2,),),))
     expected = WindowsCpuExecutionPlan(1, (0,))
-    with patch.object(cpu_execution.platform, "system", return_value="Windows"):
+    with patch(
+        "voicevox_engine.core.cpu_execution.platform.system",
+        return_value="Windows",
+    ):
         with patch(
             "voicevox_engine.core.cpu_execution_windows.detect_windows_hybrid_cpu_topology",
             return_value=topology,
@@ -275,7 +278,10 @@ def test_create_cpu_execution_plan_dispatches_linux_hybrid() -> None:
     """共通の計画生成がLinuxのhybrid検出と計画生成へ振り分ける。"""
     topology = _create_topology(((0,), (1,)), (((2,),),))
     expected = LinuxCpuExecutionPlan(1, (0,))
-    with patch.object(cpu_execution.platform, "system", return_value="Linux"):
+    with patch(
+        "voicevox_engine.core.cpu_execution.platform.system",
+        return_value="Linux",
+    ):
         with patch(
             "voicevox_engine.core.cpu_execution_linux.detect_linux_hybrid_cpu_topology",
             return_value=topology,
@@ -293,14 +299,16 @@ def test_create_cpu_execution_plan_dispatches_linux_hybrid() -> None:
 
 def test_create_cpu_execution_plan_uses_legacy_for_non_hybrid_without_psutil() -> None:
     """明示値のnon-hybrid計画はpsutilを読まずlegacy計画を返す。"""
-    with patch.object(cpu_execution.platform, "system", return_value="Linux"):
+    with patch(
+        "voicevox_engine.core.cpu_execution.platform.system",
+        return_value="Linux",
+    ):
         with patch(
             "voicevox_engine.core.cpu_execution_linux.detect_linux_hybrid_cpu_topology",
             return_value=None,
         ):
-            with patch.object(
-                cpu_execution.psutil,
-                "cpu_count",
+            with patch(
+                "voicevox_engine.core.cpu_execution.psutil.cpu_count",
                 side_effect=AssertionError("psutilは呼び出されません"),
             ):
                 plan = cpu_execution.create_cpu_execution_plan(3)
@@ -310,10 +318,12 @@ def test_create_cpu_execution_plan_uses_legacy_for_non_hybrid_without_psutil() -
 
 def test_create_cpu_execution_plan_uses_legacy_for_darwin() -> None:
     """Darwinの計画生成はlegacyへ振り分ける。"""
-    with patch.object(cpu_execution.platform, "system", return_value="Darwin"):
-        with patch.object(
-            cpu_execution.psutil,
-            "cpu_count",
+    with patch(
+        "voicevox_engine.core.cpu_execution.platform.system",
+        return_value="Darwin",
+    ):
+        with patch(
+            "voicevox_engine.core.cpu_execution.psutil.cpu_count",
             side_effect=[8, 8],
         ):
             plan = cpu_execution.create_cpu_execution_plan(None)
@@ -323,9 +333,8 @@ def test_create_cpu_execution_plan_uses_legacy_for_darwin() -> None:
 
 def test_create_cpu_execution_plan_validates_before_os_detection() -> None:
     """不正なCPUスレッド数はOS検出前に拒否する。"""
-    with patch.object(
-        cpu_execution.platform,
-        "system",
+    with patch(
+        "voicevox_engine.core.cpu_execution.platform.system",
         side_effect=AssertionError("OS検出は開始されません"),
     ):
         with pytest.raises(ValueError, match="cpu_num_threads"):
@@ -334,7 +343,10 @@ def test_create_cpu_execution_plan_validates_before_os_detection() -> None:
 
 def test_create_cpu_execution_plan_rejects_unknown_os() -> None:
     """未知のOSを共通計画生成で拒否する。"""
-    with patch.object(cpu_execution.platform, "system", return_value="Plan9"):
+    with patch(
+        "voicevox_engine.core.cpu_execution.platform.system",
+        return_value="Plan9",
+    ):
         with pytest.raises(RuntimeError, match="対応していないOS"):
             cpu_execution.create_cpu_execution_plan(None)
 
