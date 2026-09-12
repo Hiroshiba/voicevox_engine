@@ -10,6 +10,7 @@ from test.e2e.single_api.utils import gen_mora
 from test.utility import hash_wave_floats_from_wav_bytes
 from voicevox_engine.app.application import generate_app
 from voicevox_engine.cancellable_engine import CancellableEngine
+from voicevox_engine.core.cpu_execution import LegacyCpuExecutionPlan
 
 
 @pytest.fixture
@@ -18,6 +19,7 @@ def cancellable_client(app_params: dict[str, Any]) -> TestClient:
         init_processes=1,
         use_gpu=False,
         enable_mock=True,
+        cpu_execution_plan=LegacyCpuExecutionPlan(1),
     )
     cancellable_app = generate_app(**app_params)
     return TestClient(cancellable_app)
